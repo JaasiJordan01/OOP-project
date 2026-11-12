@@ -1,10 +1,15 @@
 import com.sun.net.httpserver.HttpExchange;
 import com.sun.net.httpserver.HttpServer;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
 import java.net.URI;
 import java.net.URLDecoder;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
+import java.nio.file.StandardOpenOption;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.security.SecureRandom;
@@ -17,6 +22,9 @@ import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.stream.Collectors;
+import javax.imageio.ImageIO;
+import javax.imageio.ImageReader;
+import javax.imageio.stream.ImageInputStream;
 
 /**
  * =============================================================================
@@ -34,6 +42,11 @@ public class YEPWebApp {
     // ==================== GLOBAL STATE ====================
     static final int PORT = Integer.parseInt(System.getenv().getOrDefault("PORT", "8080"));
     static final DateTimeFormatter DATE_FMT = DateTimeFormatter.ofPattern("dd MMM yyyy");
+    static final int MAX_PROFILE_PHOTO_BYTES = 2 * 1024 * 1024;
+    static final int MAX_FORM_BODY_BYTES = 3 * 1024 * 1024;
+    static final Path PROFILE_PHOTO_DIR = Paths.get(
+            System.getenv().getOrDefault("YEP_PROFILE_PHOTO_DIR", "uploads/profile-photos"))
+            .toAbsolutePath().normalize();
 
     static final Repository<User>             USERS      = new InMemoryRepository<>();
     static final Repository<LearningActivity> ACTIVITIES = new InMemoryRepository<>();
@@ -93,11 +106,42 @@ public class YEPWebApp {
             String method = ex.getRequestMethod();
             User   user   = currentUser(ex);
 
+            if (user != null && USERS.findById(user.getId()).isEmpty()) {
+                String sid = readCookie(ex, "YEP_SESSION");
+                if (sid != null) SESSIONS.remove(sid);
+                ex.getResponseHeaders().add("Set-Cookie", "YEP_SESSION=; Path=/; Max-Age=0; SameSite=Lax");
+                redirect(ex, "/login");
+                return;
+            }
+            if (isPendingYouth(user)
+                    && !path.equals("/enrollment") && !path.equals("/profile") && !path.equals("/logout")
+                    && !path.startsWith("/profile-photo/")) {
+                redirect(ex, "/enrollment");
+                return;
+            }
+            if (path.startsWith("/profile-photo/")) {
+                profilePhotoGet(ex, user, path);
+                return;
+            }
+            if (isLimitedStakeholder(user)
+                    && !Set.of("/", "/dashboard", "/activities", "/profile", "/logout").contains(path)) {
+                setFlash(ex, "This stakeholder account can access its profile and public programme information only.", true);
+                redirect(ex, "/dashboard");
+                return;
+            }
+
             switch (path) {
                 case "/"            -> home(ex, user);
                 case "/register"    -> { if (method.equals("POST")) registerPost(ex); else registerGet(ex, null); }
                 case "/login"       -> { if (method.equals("POST")) loginPost(ex);    else loginGet(ex, null); }
                 case "/logout"      -> logout(ex);
+                case "/profile"    -> { if (method.equals("POST")) profilePost(ex, user); else profileGet(ex, user, null); }
+                case "/enrollment" -> { if (method.equals("POST")) enrollmentPost(ex, user); else enrollmentGet(ex, user); }
+                case "/level-one/complete" -> {
+                    if (method.equals("POST")) levelOneCompletePost(ex, user);
+                    else sendHtml(ex, 405, page("Method not allowed", user, "/level-one",
+                            "<div class='card'><h1>Method not allowed</h1></div>"));
+                }
                 case "/age-verification" -> {
                     if (method.equals("GET")) ageVerificationGet(ex, user);
                     else sendHtml(ex, 405, page("Method not allowed", user, "/age-verification",
@@ -126,6 +170,9 @@ public class YEPWebApp {
                 default             -> sendHtml(ex, 404, page("Not found", user, "/",
                         "<div class='card text-center'><h1>404</h1><p class='muted'>Page not found.</p><a class='btn primary' href='/'>Return Home</a></div>"));
             }
+        } catch (RequestTooLargeException e) {
+            sendHtml(ex, 413, page("Request too large", currentUser(ex), "/profile",
+                    "<div class='card'><h1>Request too large</h1><p class='muted'>Profile photo uploads are limited to 2 MB.</p></div>"));
         } catch (Exception e) {
             e.printStackTrace();
             try {
@@ -146,6 +193,16 @@ public class YEPWebApp {
                 "<div class='card text-center'><h2 style='font-size:2rem'>💬</h2><h3>Discussions</h3><p class='muted'>Ask questions, share ideas, and get guidance from mentors and facilitators.</p></div>" +
                 "<div class='card text-center'><h2 style='font-size:2rem'>🏅</h2><h3>Certificates</h3><p class='muted'>Verifiable digital certificates that universities and employers can trust.</p></div>" +
             "</section>" +
+            "<section class='card mt-4'><h2>YEP Stakeholders</h2><p class='muted'>A shared platform for the people and organizations who support youth learning and impact.</p><div class='grid'>" +
+                "<div><strong>Youth Participants</strong><p class='muted'>Learn, exchange ideas, build teams, and deliver community projects.</p></div>" +
+                "<div><strong>Facilitators / Lecturers</strong><p class='muted'>Organize learning activities, sessions, assessment, and feedback.</p></div>" +
+                "<div><strong>Mentors</strong><p class='muted'>Guide teams and review project progress.</p></div>" +
+                "<div><strong>Universities / Institutions</strong><p class='muted'>Support education and cross-border collaboration.</p></div>" +
+                "<div><strong>Employers</strong><p class='muted'>Offer career guidance, mentorship, and opportunities.</p></div>" +
+                "<div><strong>Partner Organisations</strong><p class='muted'>Contribute resources, training, and project support.</p></div>" +
+                "<div><strong>Administrators</strong><p class='muted'>Manage accounts, activities, access, and programme reporting.</p></div>" +
+                "<div><strong>Researchers / Students</strong><p class='muted'>Engage with authorized programme information and learning outcomes.</p></div>" +
+            "</div></section>" +
             "<div class='card text-center mt-4' style='background:linear-gradient(135deg,#0a1f5c,#1d4ed8);color:#fff;border:none'>" +
                 "<h2 style='color:#fff'>Ready to join the exchange?</h2>" +
                 "<p style='opacity:0.9;margin-bottom:20px'>Learn together. Build together. Get recognised.</p>" +
@@ -170,8 +227,12 @@ public class YEPWebApp {
               <label class="fld"><span aria-hidden="true">📞</span><input type="tel" name="phone" placeholder="Phone Number" autocomplete="tel"></label>
               <label class="fld"><span aria-hidden="true">🎓</span><select name="role" id="role" aria-label="Account type" onchange="toggleRoleFields()" required>
                 <option value="YOUTH">Youth Participant (18–35)</option>
+                <option value="FACILITATOR">Facilitator / Lecturer</option>
                 <option value="MENTOR">Mentor</option>
-                <option value="FACILITATOR">Facilitator</option>
+                <option value="UNIVERSITY">University / Educational Institution</option>
+                <option value="EMPLOYER">Employer</option>
+                <option value="PARTNER">Partner Organisation</option>
+                <option value="RESEARCHER">Researcher / Student</option>
               </select></label>
               <div id="youthFields" class="auth-fields">
                 <label class="fld"><span aria-hidden="true">🎂</span><input type="date" id="dob" name="dob" min="%s" max="%s" required aria-label="Date of birth"></label>
@@ -183,9 +244,9 @@ public class YEPWebApp {
                 <label class="fld"><span aria-hidden="true">📍</span><input name="district" placeholder="District" autocomplete="address-level2"></label>
                 <label class="fld"><span aria-hidden="true">📚</span><select name="education" aria-label="Highest education"><option value="">Highest education (optional)</option>%s</select></label>
               </div>
-              <div id="mentorFields" class="auth-fields" style="display:none">
-                <label class="fld"><span aria-hidden="true">✨</span><select name="expertise" aria-label="Area of expertise"><option value="">Area of expertise</option>%s</select></label>
-                <label class="fld"><span aria-hidden="true">🏢</span><input name="organisation" placeholder="Organisation"></label>
+              <div id="stakeholderFields" class="auth-fields" style="display:none">
+                <label class="fld"><span aria-hidden="true">✨</span><select name="expertise" aria-label="Area of expertise"><option value="">Area of expertise (optional)</option>%s</select></label>
+                <label class="fld"><span aria-hidden="true">🏢</span><input name="organisation" placeholder="Organisation / Institution"></label>
               </div>
               <label class="fld"><span aria-hidden="true">🔒</span><input type="password" name="password" required minlength="8" placeholder="Password (at least 8 characters)" autocomplete="new-password"></label>
               <label class="fld"><span aria-hidden="true">🔒</span><input type="password" name="confirmPassword" required minlength="8" placeholder="Confirm Password" autocomplete="new-password"></label>
@@ -198,7 +259,7 @@ public class YEPWebApp {
               function toggleRoleFields(){
                 var youth=document.getElementById('role').value==='YOUTH';
                 document.getElementById('youthFields').style.display=youth?'grid':'none';
-                document.getElementById('mentorFields').style.display=youth?'none':'grid';
+                document.getElementById('stakeholderFields').style.display=youth?'none':'grid';
                 document.getElementById('dob').required=youth;
               }
               toggleRoleFields();
@@ -215,7 +276,7 @@ public class YEPWebApp {
         Map<String, String> f = parseForm(ex);
         try {
             String role = f.get("role");
-            if (role == null || !List.of("YOUTH", "MENTOR", "FACILITATOR").contains(role)) {
+            if (role == null || !List.of("YOUTH", "MENTOR", "FACILITATOR", "UNIVERSITY", "EMPLOYER", "PARTNER", "RESEARCHER").contains(role)) {
                 throw new ValidationException("Choose a supported registration type.");
             }
             if (!"accepted".equals(f.get("terms"))) throw new ValidationException("Please accept the Terms & Conditions and Privacy Policy.");
@@ -237,12 +298,11 @@ public class YEPWebApp {
                 YOUTH_AGE_STATUS.put(u.getId(), "PENDING");
                 YOUTH_DATE_OF_BIRTH.put(u.getId(), dob);
                 YOUTH_REGISTERED_ON.put(u.getId(), LocalDate.now());
-                String pending = "<div class='auth-message'><div class='auth-symbol'>✓</div><h1>Registration received</h1>"
-                        + "<p>Your age is within the programme range. An administrator must review proof of age before you can sign in.</p>"
-                        + "<p>For your privacy, YEP does not ask you to upload an identity document. Please present an official proof of age to the YEP team.</p>"
-                        + "<a class='btn primary full' href='/login'>Continue to sign in</a></div>";
-                sendHtml(ex, 200, authPage("Registration received", "Your YEP journey<br><b>starts here</b>",
-                        "A quick age check helps keep the youth programme safe and fair.", pending));
+                String sid = UUID.randomUUID().toString();
+                SESSIONS.put(sid, u);
+                setSessionCookie(ex, sid);
+                setFlash(ex, "Registration received. Complete the enrollment form while your age verification is pending.");
+                redirect(ex, "/enrollment");
                 return;
             }
             String sid = UUID.randomUUID().toString();
@@ -277,6 +337,14 @@ public class YEPWebApp {
         Map<String, String> f = parseForm(ex);
         try {
             User u = AUTH.login(f.get("email"), f.get("password"));
+            if (u instanceof YouthParticipant && "PENDING".equals(YOUTH_AGE_STATUS.get(u.getId()))) {
+                String sid = UUID.randomUUID().toString();
+                SESSIONS.put(sid, u);
+                setSessionCookie(ex, sid);
+                setFlash(ex, "Age verification is pending. You can complete enrollment while you wait.");
+                redirect(ex, "/enrollment");
+                return;
+            }
             if (u instanceof YouthParticipant && !"VERIFIED".equals(YOUTH_AGE_STATUS.get(u.getId()))) {
                 loginGet(ex, "Your account is awaiting manual age verification.");
                 return;
@@ -362,6 +430,9 @@ public class YEPWebApp {
                 AGE_REVIEWED_AT.put(userId, LocalDateTime.now());
                 setFlash(ex, "Age verified. " + applicant.getName() + " can now sign in.");
             } else if ("reject".equals(decision)) {
+                deleteProfilePhoto(applicant.getProfile().getPhotoUrl());
+                ENROLLS.findAll().stream().filter(e -> e.getUserId().equals(userId))
+                        .map(Enrollment::getId).toList().forEach(ENROLLS::delete);
                 USERS.delete(userId);
                 YOUTH_AGE_STATUS.remove(userId);
                 YOUTH_DATE_OF_BIRTH.remove(userId);
@@ -376,6 +447,250 @@ public class YEPWebApp {
             setFlash(ex, e.getMessage(), true);
         }
         redirect(ex, "/age-verification");
+    }
+
+    static void enrollmentGet(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        if (!(user instanceof YouthParticipant)) {
+            sendHtml(ex, 403, page("Enrollment", user, "/enrollment",
+                    "<div class='card'><h1>Youth enrollment only</h1><p class='muted'>This enrollment form is for youth participants.</p></div>"));
+            return;
+        }
+        List<LearningActivity> activities = LEARNING.byLevel(1);
+        StringBuilder options = new StringBuilder();
+        for (LearningActivity activity : activities) {
+            boolean enrolled = hasEnrollment(user, activity);
+            options.append("<label class='enrollment-option'><input type='checkbox' name='activityId' value='")
+                    .append(activity.getId()).append("'").append(enrolled ? " checked disabled" : "")
+                    .append("><span><strong>").append(esc(activity.getTitle())).append("</strong><br><span class='muted'>")
+                    .append(esc(activity.getCategory())).append(" · ").append(activity.getType()).append("</span>")
+                    .append(enrolled ? " <span class='badge success'>Enrolled</span>" : "")
+                    .append("</span></label>");
+        }
+        String ageStatus = "PENDING".equals(YOUTH_AGE_STATUS.get(user.getId()))
+                ? "<div class='alert' style='background:#fef3c7;border:1px solid #fde68a;color:#92400e'>Your age review is pending. You can complete enrollment now, but learning access remains locked until an administrator verifies your age.</div>"
+                : "<div class='alert success'>Your youth account is verified. Choose the Level One activities you want to enroll in.</div>";
+        String content = "<div class='page-header'><h1>Level One Enrollment</h1><p class='muted'>Welcome to YEP. Start by choosing the Level One learning and Virtual Exchange activities you want to join.</p></div>"
+                + ageStatus
+                + "<form method='post' action='/enrollment' class='card'><h2>Choose Level One activities</h2>"
+                + (options.length() == 0 ? "<p class='muted'>No Level One activities are available yet.</p>" : options)
+                + "<button class='btn primary mt-4' type='submit'>Save enrollment</button></form>"
+                + "<p class='muted'>You can update your profile photo and contact details from <a href='/profile'>My Profile</a>.</p>";
+        sendHtml(ex, 200, page("Level One Enrollment", user, "/enrollment", content));
+    }
+
+    static void enrollmentPost(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        if (!(user instanceof YouthParticipant)) {
+            sendHtml(ex, 403, page("Enrollment", user, "/enrollment",
+                    "<div class='card'><h1>Youth enrollment only</h1></div>"));
+            return;
+        }
+        Map<String, String> form = parseForm(ex);
+        try {
+            List<String> selected = Arrays.asList(form.getOrDefault("activityId", "").split(","));
+            int enrolledCount = 0;
+            for (String id : selected) {
+                if (id.isBlank()) continue;
+                LearningActivity activity = ACTIVITIES.findById(Long.parseLong(id))
+                        .filter(a -> a.getLevel() == ActivityLevel.LEVEL_ONE)
+                        .filter(LearningActivity::isPublished)
+                        .orElseThrow(() -> new ValidationException("Choose a valid, published Level One activity."));
+                if (!hasEnrollment(user, activity)) {
+                    LEARNING.enroll(user, activity);
+                    enrolledCount++;
+                }
+            }
+            setFlash(ex, enrolledCount == 0
+                    ? "Your existing Level One enrollments are unchanged."
+                    : "Enrolled in " + enrolledCount + " Level One activity" + (enrolledCount == 1 ? "." : "ies."));
+            redirect(ex, "/level-one");
+        } catch (Exception e) {
+            setFlash(ex, "Enrollment failed: " + e.getMessage(), true);
+            redirect(ex, "/enrollment");
+        }
+    }
+
+    static void profileGet(HttpExchange ex, User user, String error) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        StringBuilder fields = new StringBuilder();
+        fields.append("<div class='grid-2'><div><label>Full name</label><input name='name' required value='")
+                .append(esc(user.getName())).append("'></div><div><label>Email</label><input value='")
+                .append(esc(user.getEmail())).append("' disabled></div></div>")
+                .append("<label class='mt-2'>Phone</label><input name='phone' value='")
+                .append(esc(user.getPhone())).append("'>")
+                .append("<label class='mt-2'>Bio</label><textarea name='bio' rows='3'>")
+                .append(esc(user.getProfile().getBio())).append("</textarea>");
+        if (user instanceof YouthParticipant youth) {
+            fields.append("<div class='grid-2 mt-2'><div><label>Country</label><input name='country' value='")
+                    .append(esc(youth.getCountry())).append("'></div><div><label>District</label><input name='district' value='")
+                    .append(esc(youth.getDistrict())).append("'></div></div>")
+                    .append("<div class='grid-2 mt-2'><div><label>Gender</label><input name='gender' value='")
+                    .append(esc(youth.getGender())).append("'></div><div><label>Education</label><input name='education' value='")
+                    .append(esc(youth.getEducationLevel())).append("'></div></div>");
+        }
+        if (user instanceof Facilitator facilitator) {
+            fields.append("<label class='mt-2'>Expertise</label><input name='expertise' value='")
+                    .append(esc(facilitator.getExpertise())).append("'>");
+        } else if (user instanceof Mentor mentor) {
+            fields.append("<div class='grid-2 mt-2'><div><label>Expertise</label><input name='expertise' value='")
+                    .append(esc(mentor.getExpertise())).append("'></div><div><label>Organisation</label><input name='organisation' value='")
+                    .append(esc(mentor.getOrganisation())).append("'></div></div>");
+        } else if (user instanceof PartnerOrganisation partner) {
+            fields.append("<label class='mt-2'>Organisation type</label><input name='organisation' value='")
+                    .append(esc(partner.getOrgType())).append("'>");
+        } else if (user instanceof StakeholderAccount stakeholder) {
+            fields.append("<div class='grid-2 mt-2'><div><label>Organisation / Institution</label><input name='organisation' value='")
+                    .append(esc(stakeholder.getOrganisation())).append("'></div><div><label>Area of interest</label><input name='expertise' value='")
+                    .append(esc(stakeholder.getExpertise())).append("'></div></div>");
+        }
+        String photo = user.getProfile().getPhotoUrl();
+        String photoView = photo == null || photo.isBlank()
+                ? "<div class='profile-photo placeholder' aria-label='No profile photo'>" + esc(initials(user.getName())) + "</div>"
+                : "<img class='profile-photo' src='" + esc(photo) + "' alt='Profile photo for " + esc(user.getName()) + "'>";
+        String errorHtml = error == null ? "" : "<div class='alert error'>" + esc(error) + "</div>";
+        String content = "<div class='page-header'><h1>My Profile</h1><p class='muted'>Manage your YEP stakeholder profile and profile photo.</p></div>"
+                + errorHtml + "<form method='post' action='/profile' class='card' id='profileForm'>"
+                + "<div class='profile-heading'>" + photoView + "<div><h2>" + esc(user.getName()) + "</h2><span class='badge'>"
+                + esc(user.getRole().getLabel()) + "</span><p class='muted mt-2'>Upload a clear JPG or PNG image (max 2 MB).</p></div></div>"
+                + "<label class='mt-4'>Profile photo</label><input type='file' id='photoFile' accept='image/jpeg,image/png'>"
+                + "<input type='hidden' name='photoData' id='photoData'><input type='hidden' name='photoMime' id='photoMime'>"
+                + fields + "<button class='btn primary mt-4' type='submit'>Save profile</button>"
+                + "<p id='photoStatus' class='muted mt-2' aria-live='polite'></p></form>"
+                + "<script>(function(){var form=document.getElementById('profileForm'),file=document.getElementById('photoFile'),data=document.getElementById('photoData'),mime=document.getElementById('photoMime'),status=document.getElementById('photoStatus');"
+                + "form.addEventListener('submit',function(e){if(!file.files.length||data.value)return;e.preventDefault();var selected=file.files[0];if(selected.size>2097152){status.textContent='Photo must be 2 MB or smaller.';return;}var reader=new FileReader();reader.onload=function(){data.value=String(reader.result).split(',')[1];mime.value=selected.type;form.submit();};reader.onerror=function(){status.textContent='Could not read the selected photo.';};reader.readAsDataURL(selected);});"
+                + "file.addEventListener('change',function(){data.value='';mime.value='';status.textContent=file.files.length?'Photo selected. It will be uploaded when you save.':'';});})();</script>";
+        sendHtml(ex, 200, page("My Profile", user, "/profile", content));
+    }
+
+    static void profilePost(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        Map<String, String> form = parseForm(ex);
+        try {
+            if (ValidationUtil.isBlank(form.get("name"))) throw new ValidationException("Name required");
+            saveProfilePhoto(user, form.get("photoMime"), form.get("photoData"));
+            user.setName(form.get("name"));
+            user.setPhone(form.get("phone"));
+            user.getProfile().setBio(form.get("bio"));
+            if (user instanceof YouthParticipant youth) {
+                youth.setGender(form.get("gender"));
+                youth.setCountry(form.get("country"));
+                youth.setDistrict(form.get("district"));
+                youth.setEducationLevel(form.get("education"));
+            }
+            if (user instanceof Facilitator facilitator) facilitator.setExpertise(form.get("expertise"));
+            if (user instanceof Mentor mentor) {
+                mentor.setExpertise(form.get("expertise"));
+                mentor.setOrganisation(form.get("organisation"));
+            }
+            if (user instanceof PartnerOrganisation partner) partner.setOrgType(form.get("organisation"));
+            if (user instanceof StakeholderAccount stakeholder) {
+                stakeholder.setOrganisation(form.get("organisation"));
+                stakeholder.setExpertise(form.get("expertise"));
+            }
+            setFlash(ex, "Profile updated successfully.");
+            redirect(ex, "/profile");
+        } catch (Exception e) {
+            profileGet(ex, user, e.getMessage());
+        }
+    }
+
+    static void profilePhotoGet(HttpExchange ex, User user, String requestPath) throws IOException {
+        if (user == null) { sendHtml(ex, 401, "<!doctype html><html><body>Sign in required.</body></html>"); return; }
+        String fileName = requestPath.substring("/profile-photo/".length());
+        if (!fileName.matches("[0-9a-fA-F-]{36}\\.(png|jpg)")) {
+            sendHtml(ex, 404, "<!doctype html><html><body>Photo not found.</body></html>");
+            return;
+        }
+        Path photoPath = PROFILE_PHOTO_DIR.resolve(fileName).normalize();
+        if (!photoPath.startsWith(PROFILE_PHOTO_DIR) || !Files.isRegularFile(photoPath)
+                || Files.size(photoPath) > MAX_PROFILE_PHOTO_BYTES) {
+            sendHtml(ex, 404, "<!doctype html><html><body>Photo not found.</body></html>");
+            return;
+        }
+        byte[] image = Files.readAllBytes(photoPath);
+        ex.getResponseHeaders().set("Content-Type", fileName.endsWith(".png") ? "image/png" : "image/jpeg");
+        ex.getResponseHeaders().set("X-Content-Type-Options", "nosniff");
+        ex.getResponseHeaders().set("Cache-Control", "private, max-age=3600");
+        ex.sendResponseHeaders(200, image.length);
+        try (OutputStream os = ex.getResponseBody()) { os.write(image); }
+    }
+
+    static void saveProfilePhoto(User user, String mime, String encoded) throws IOException {
+        if ((mime == null || mime.isBlank()) && (encoded == null || encoded.isBlank())) return;
+        if (mime == null || encoded == null || encoded.isBlank()) {
+            throw new ValidationException("Select a JPG or PNG profile photo.");
+        }
+        long maxEncodedLength = ((MAX_PROFILE_PHOTO_BYTES + 2L) / 3L) * 4L;
+        if (encoded.length() > maxEncodedLength) throw new ValidationException("Profile photo must be 2 MB or smaller.");
+        String extension;
+        if ("image/png".equals(mime)) extension = ".png";
+        else if ("image/jpeg".equals(mime)) extension = ".jpg";
+        else throw new ValidationException("Only JPG and PNG profile photos are supported.");
+        byte[] image;
+        try { image = Base64.getDecoder().decode(encoded); }
+        catch (IllegalArgumentException e) { throw new ValidationException("The selected profile photo is not valid base64 data."); }
+        if (image.length == 0 || image.length > MAX_PROFILE_PHOTO_BYTES || !hasImageSignature(image, mime)) {
+            throw new ValidationException("The uploaded file does not match its declared image type or exceeds 2 MB.");
+        }
+        validateImageDimensions(image);
+        Files.createDirectories(PROFILE_PHOTO_DIR);
+        String fileName = UUID.randomUUID() + extension;
+        Path imagePath = PROFILE_PHOTO_DIR.resolve(fileName).normalize();
+        Files.write(imagePath, image, StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE);
+        String oldUrl = user.getProfile().getPhotoUrl();
+        user.getProfile().setPhotoUrl("/profile-photo/" + fileName);
+        deleteProfilePhoto(oldUrl);
+    }
+
+    static boolean hasImageSignature(byte[] image, String mime) {
+        if ("image/png".equals(mime)) {
+            byte[] signature = {(byte) 0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a};
+            return image.length >= signature.length && Arrays.equals(Arrays.copyOf(image, signature.length), signature);
+        }
+        return "image/jpeg".equals(mime) && image.length >= 3
+                && (image[0] & 0xff) == 0xff && (image[1] & 0xff) == 0xd8 && (image[2] & 0xff) == 0xff;
+    }
+
+    static void validateImageDimensions(byte[] image) throws IOException {
+        try (ImageInputStream input = ImageIO.createImageInputStream(new ByteArrayInputStream(image))) {
+            if (input == null) throw new ValidationException("The uploaded image could not be read.");
+            Iterator<ImageReader> readers = ImageIO.getImageReaders(input);
+            if (!readers.hasNext()) throw new ValidationException("The uploaded image could not be read.");
+            ImageReader reader = readers.next();
+            try {
+                reader.setInput(input, true, true);
+                int width = reader.getWidth(0);
+                int height = reader.getHeight(0);
+                if (width < 1 || height < 1 || width > 4096 || height > 4096 || (long) width * height > 12_000_000L) {
+                    throw new ValidationException("Profile photo dimensions must not exceed 4096 × 4096 pixels.");
+                }
+            } finally {
+                reader.dispose();
+            }
+        }
+    }
+
+    static void deleteProfilePhoto(String photoUrl) {
+        if (photoUrl == null || !photoUrl.startsWith("/profile-photo/")) return;
+        String fileName = photoUrl.substring("/profile-photo/".length());
+        if (!fileName.matches("[0-9a-fA-F-]{36}\\.(png|jpg)")) return;
+        Path photoPath = PROFILE_PHOTO_DIR.resolve(fileName).normalize();
+        if (!photoPath.startsWith(PROFILE_PHOTO_DIR)) return;
+        try { Files.deleteIfExists(photoPath); }
+        catch (IOException e) { System.err.println("Could not remove replaced profile photo: " + e.getMessage()); }
+    }
+
+    static boolean hasEnrollment(User user, LearningActivity activity) {
+        return ENROLLS.findAll().stream().anyMatch(enrollment ->
+                enrollment.getUserId().equals(user.getId()) && enrollment.getActivityId().equals(activity.getId()));
+    }
+
+    static String initials(String name) {
+        if (name == null || name.isBlank()) return "?";
+        String[] parts = name.trim().split("\\s+");
+        return parts.length == 1 ? parts[0].substring(0, 1).toUpperCase(Locale.ROOT)
+                : (parts[0].substring(0, 1) + parts[parts.length - 1].substring(0, 1)).toUpperCase(Locale.ROOT);
     }
 
     static LocalDate parseDateOfBirth(String value) {
@@ -403,6 +718,14 @@ public class YEPWebApp {
 
     static void dashboard(HttpExchange ex, User user) throws IOException {
         if (user == null) { redirect(ex, "/login"); return; }
+        if (isLimitedStakeholder(user)) {
+            String content = "<div class='page-header'><h1>Stakeholder Dashboard</h1><p class='muted'>"
+                    + esc(user.getDashboardSummary()) + "</p></div><div class='card'><h2>Welcome to YEP</h2>"
+                    + "<p class='muted'>Your account can view public programme activities and manage its profile. Participant records and project work remain private unless an authorized feature is added.</p>"
+                    + "<a class='btn primary' href='/activities'>View programme activities</a> <a class='btn' href='/profile'>Manage profile</a></div>";
+            sendHtml(ex, 200, page("Stakeholder Dashboard", user, "/dashboard", content));
+            return;
+        }
         List<LearningActivity> myActs = LEARNING.forUser(user.getId());
         Optional<Team> myTeam = TEAM_SVC.findByMember(user);
         List<Certificate> certs = CERTS.findAll().stream()
@@ -481,7 +804,10 @@ public class YEPWebApp {
         String cat = q.getOrDefault("category", "");
         String lvl = q.getOrDefault("level", "");
 
-        List<LearningActivity> all = ACTIVITIES.findAll().stream().filter(LearningActivity::isPublished).collect(Collectors.toList());
+        List<LearningActivity> all = ACTIVITIES.findAll().stream()
+                .filter(LearningActivity::isPublished)
+                .filter(a -> a.getLevel() == ActivityLevel.LEVEL_ONE || canAccessLevelTwo(user))
+                .collect(Collectors.toList());
         List<LearningActivity> filtered = all.stream()
                 .filter(a -> cat.isEmpty() || cat.equals(a.getCategory()))
                 .filter(a -> lvl.isEmpty() || Integer.parseInt(lvl) == a.getLevel().getValue())
@@ -504,9 +830,13 @@ public class YEPWebApp {
                     .append("</div>")
                     .append("<div style='margin-left:20px'>");
                 if (a.getLevel().getValue() == 1) {
-                    boolean enrolled = ENROLLS.findAll().stream().anyMatch(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(a.getId()));
-                    if (enrolled) list.append("<span class='badge success'>Enrolled ✓</span>");
-                    else list.append("<form method='post' action='/enroll'><input type='hidden' name='activityId' value='").append(a.getId()).append("'><button class='btn primary' type='submit'>Enroll</button></form>");
+                    if (!(user instanceof YouthParticipant)) {
+                        list.append("<span class='badge'>Youth participants</span>");
+                    } else {
+                        boolean enrolled = hasEnrollment(user, a);
+                        if (enrolled) list.append("<span class='badge success'>Enrolled ✓</span>");
+                        else list.append("<form method='post' action='/enroll'><input type='hidden' name='activityId' value='").append(a.getId()).append("'><button class='btn primary' type='submit'>Enroll</button></form>");
+                    }
                 } else {
                     list.append("<a class='btn' href='/level-two'>Go to Level 2</a>");
                 }
@@ -516,6 +846,8 @@ public class YEPWebApp {
 
         String content =
             "<h1>Explore Activities</h1>" +
+            (user instanceof YouthParticipant && !canAccessLevelTwo(user)
+                ? "<div class='alert' style='background:#fef3c7;border:1px solid #fde68a;color:#92400e'>Level Two activities are locked until you complete every Level One activity. <a href='/level-one'>Continue Level One</a>.</div>" : "") +
             "<div class='card' style='padding:16px;margin-bottom:24px'>" +
                 "<form method='get' action='/activities' class='flex-row'>" +
                     "<div style='flex:1'><label>Category</label><select name='category' onchange='this.form.submit()'>" + catOpts + "</select></div>" +
@@ -532,10 +864,18 @@ public class YEPWebApp {
 
     static void enroll(HttpExchange ex, User user) throws IOException {
         if (user == null) { redirect(ex, "/login"); return; }
+        if (!(user instanceof YouthParticipant)) {
+            sendHtml(ex, 403, page("Enrollment", user, "/activities",
+                    "<div class='card'><h1>Youth enrollment only</h1></div>"));
+            return;
+        }
         Map<String, String> f = parseForm(ex);
         try {
             Long aid = Long.parseLong(f.get("activityId"));
             LearningActivity a = ACTIVITIES.findById(aid).orElseThrow(() -> new ValidationException("Activity not found"));
+            if (a.getLevel() == ActivityLevel.LEVEL_TWO && !canAccessLevelTwo(user)) {
+                throw new ValidationException("Complete all Level One activities before enrolling in Level Two.");
+            }
             LEARNING.enroll(user, a);
             setFlash(ex, "Successfully enrolled in " + a.getTitle());
             redirect(ex, "/dashboard");
@@ -547,10 +887,22 @@ public class YEPWebApp {
 
     static void levelOne(HttpExchange ex, User user) throws IOException {
         if (user == null) { redirect(ex, "/login"); return; }
-        List<LearningActivity> list = LEARNING.byLevel(1);
+        List<LearningActivity> list = LEARNING.byLevel(1).stream()
+                .filter(LearningActivity::isPublished).collect(Collectors.toList());
 
         StringBuilder sb = new StringBuilder();
         sb.append("<div class='page-header'><h1>Level One — Virtual Exchange</h1><p class='muted'>Large-group online sessions covering digital literacy, AI, critical thinking, media literacy, and intercultural communication.</p></div>");
+        if (user instanceof YouthParticipant) {
+            int total = requiredLevelOneActivities().size();
+            int completed = completedLevelOneCount(user);
+            sb.append("<div class='card'><h2>Level One progress</h2><p class='muted'>")
+                    .append(completed).append(" of ").append(total).append(" activities completed</p><div class='progress-track'><div class='progress-fill' style='width:")
+                    .append(total == 0 ? 0 : completed * 100 / total).append("%'></div></div>")
+                    .append(total > 0 && completed == total
+                            ? "<p class='badge success mt-2'>Level Two unlocked</p>"
+                            : "<p class='muted mt-2'>Complete every activity to unlock Level Two.</p>")
+                    .append("</div>");
+        }
 
         sb.append("<div class='card'><h2>Available Sessions</h2>");
         if (list.isEmpty()) sb.append("<p class='muted'>No Level One sessions yet.</p>");
@@ -558,9 +910,20 @@ public class YEPWebApp {
             for (LearningActivity a : list) {
                 sb.append("<div class='list-item'>")
                   .append("<div><strong>").append(esc(a.getTitle())).append("</strong><br><span class='muted'>").append(a.getType()).append(" · ").append(esc(a.getCategory())).append("</span></div>");
-                boolean enrolled = ENROLLS.findAll().stream().anyMatch(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(a.getId()));
-                if (enrolled) sb.append("<span class='badge success'>Enrolled ✓</span>");
-                else sb.append("<form method='post' action='/enroll'><input type='hidden' name='activityId' value='").append(a.getId()).append("'><button class='btn primary small'>Join</button></form>");
+                if (!(user instanceof YouthParticipant)) {
+                    sb.append("<span class='badge'>Youth participants</span>");
+                } else {
+                    Optional<Enrollment> enrollment = ENROLLS.findAll().stream()
+                            .filter(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(a.getId())).findFirst();
+                    if (enrollment.isEmpty()) {
+                        sb.append("<form method='post' action='/enroll'><input type='hidden' name='activityId' value='").append(a.getId()).append("'><button class='btn primary small'>Join</button></form>");
+                    } else if (enrollment.get().getStatus() == EnrollmentStatus.COMPLETED) {
+                        sb.append("<span class='badge success'>Completed ✓</span>");
+                    } else {
+                        sb.append("<form method='post' action='/level-one/complete'><input type='hidden' name='activityId' value='")
+                                .append(a.getId()).append("'><button class='btn small'>Mark complete</button></form>");
+                    }
+                }
                 sb.append("</div>");
             }
         }
@@ -596,8 +959,75 @@ public class YEPWebApp {
         sendHtml(ex, 200, page("Level One", user, "/level-one", sb.toString()));
     }
 
+    static void levelOneCompletePost(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        if (!(user instanceof YouthParticipant) || !user.isActive()
+                || !"VERIFIED".equals(YOUTH_AGE_STATUS.get(user.getId()))) {
+            sendHtml(ex, 403, page("Level One", user, "/level-one",
+                    "<div class='card'><h1>Verified youth account required</h1></div>"));
+            return;
+        }
+        Map<String, String> form = parseForm(ex);
+        try {
+            long activityId = Long.parseLong(form.getOrDefault("activityId", ""));
+            LearningActivity activity = ACTIVITIES.findById(activityId)
+                    .filter(a -> a.getLevel() == ActivityLevel.LEVEL_ONE && a.isPublished())
+                    .orElseThrow(() -> new ValidationException("Published Level One activity not found."));
+            Enrollment enrollment = ENROLLS.findAll().stream()
+                    .filter(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(activityId))
+                    .findFirst().orElseThrow(() -> new ValidationException("Enroll in this activity before marking it complete."));
+            enrollment.updateProgress(100);
+            if (hasCompletedLevelOne(user)) ((YouthParticipant) user).setLevelTwoEligible(true);
+            setFlash(ex, hasCompletedLevelOne(user)
+                    ? "Level One complete. Level Two is now unlocked."
+                    : "Activity marked complete. Continue until every Level One activity is complete.");
+        } catch (Exception e) {
+            setFlash(ex, "Could not complete activity: " + e.getMessage(), true);
+        }
+        redirect(ex, "/level-one");
+    }
+
+    static List<LearningActivity> requiredLevelOneActivities() {
+        return ACTIVITIES.findAll().stream()
+                .filter(LearningActivity::isPublished)
+                .filter(a -> a.getLevel() == ActivityLevel.LEVEL_ONE)
+                .collect(Collectors.toList());
+    }
+
+    static int completedLevelOneCount(User user) {
+        return (int) requiredLevelOneActivities().stream().filter(activity ->
+                ENROLLS.findAll().stream().anyMatch(enrollment ->
+                        enrollment.getUserId().equals(user.getId())
+                                && enrollment.getActivityId().equals(activity.getId())
+                                && enrollment.getStatus() == EnrollmentStatus.COMPLETED)).count();
+    }
+
+    static boolean hasCompletedLevelOne(User user) {
+        List<LearningActivity> required = requiredLevelOneActivities();
+        return !required.isEmpty() && completedLevelOneCount(user) == required.size();
+    }
+
+    static boolean canAccessLevelTwo(User user) {
+        if (user == null || isLimitedStakeholder(user)) return false;
+        if (!(user instanceof YouthParticipant youth)) return true;
+        return user.isActive()
+                && "VERIFIED".equals(YOUTH_AGE_STATUS.get(user.getId()))
+                && youth.isEligibleForLevelTwo()
+                && hasCompletedLevelOne(user);
+    }
+
     static void levelTwo(HttpExchange ex, User user) throws IOException {
         if (user == null) { redirect(ex, "/login"); return; }
+        if (user instanceof YouthParticipant && !canAccessLevelTwo(user)) {
+            int total = requiredLevelOneActivities().size();
+            int completed = completedLevelOneCount(user);
+            String content = "<div class='page-header'><h1>Level Two is locked</h1><p class='muted'>Complete all Level One activities before accessing team projects and Level Two exchanges.</p></div>"
+                    + "<div class='card'><h2>Level One progress</h2><p class='muted'>"
+                    + completed + " of " + total + " activities completed.</p><div class='progress-track'><div class='progress-fill' style='width:"
+                    + (total == 0 ? 0 : completed * 100 / total) + "%'></div></div><a class='btn primary mt-4' href='/level-one'>Continue Level One</a></div>";
+            sendHtml(ex, 403, page("Level Two locked", user, "/level-two", content));
+            return;
+        }
         List<LearningActivity> list = LEARNING.byLevel(2);
         Optional<Team> myTeam = TEAM_SVC.findByMember(user);
 
@@ -646,6 +1076,11 @@ public class YEPWebApp {
 
     static void teamPost(HttpExchange ex, User user) throws IOException {
         if (user == null) { redirect(ex, "/login"); return; }
+        if (user instanceof YouthParticipant && !canAccessLevelTwo(user)) {
+            setFlash(ex, "Complete all Level One activities before creating a Level Two team.", true);
+            redirect(ex, "/level-two");
+            return;
+        }
         Map<String, String> f = parseForm(ex);
         try {
             Long actId = Long.parseLong(f.get("activityId"));
@@ -1022,6 +1457,20 @@ public class YEPWebApp {
         .nav-links a { padding: 8px 12px; border-radius: 10px; color: #c9d4f5; font-weight: 500; font-size: 0.9rem; transition: all 0.2s; }
         .nav-links a:hover { background: rgba(255,255,255,.08); color: #fff; text-decoration: none; }
         .nav-links a.active { background: var(--primary); color: #fff; font-weight: 600; }
+        .menu-toggle { display: none; border: 0; border-radius: 8px; background: transparent; color: #fff; cursor: pointer; }
+        .menu-toggle:focus-visible, .nav-links a:focus-visible { outline: 3px solid #fbbf24; outline-offset: 2px; }
+        .menu-icon { display: flex; flex-direction: column; justify-content: center; gap: 5px; width: 24px; }
+        .menu-icon span { display: block; width: 24px; height: 2px; border-radius: 2px; background: currentColor; }
+        .nav-scrim[hidden] { display: none; }
+        .nav-profile { display: inline-flex; align-items: center; gap: 8px; }
+        .nav-avatar { width: 30px; height: 30px; border-radius: 50%; object-fit: cover; background: #fbbf24; color: #0a1f5c; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; }
+        .profile-heading { display: flex; align-items: center; gap: 20px; }
+        .profile-photo { width: 112px; height: 112px; border-radius: 50%; object-fit: cover; border: 3px solid var(--border); }
+        .profile-photo.placeholder { display: flex; align-items: center; justify-content: center; background: var(--primary-light); color: var(--primary-dark); font-size: 2rem; font-weight: 700; }
+        .enrollment-option { display: flex; align-items: flex-start; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+        .enrollment-option input { width: auto; margin-top: 5px; }
+        .progress-track { height: 10px; background: var(--bg); border-radius: 99px; overflow: hidden; }
+        .progress-fill { height: 100%; background: var(--primary); border-radius: inherit; }
         .container { max-width: 1100px; margin: 32px auto; padding: 0 20px; }
 
         /* Components */
@@ -1081,6 +1530,27 @@ public class YEPWebApp {
         .carousel .dots span.active { background: #fff; }
 
         .footer { text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 0.85rem; border-top: 1px solid var(--border); margin-top: 40px; }
+        @media (max-width: 760px) {
+            .topbar { flex-wrap: nowrap; padding: 12px 16px; gap: 12px; }
+            .brand { white-space: nowrap; }
+            .menu-toggle { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; margin-left: auto; position: relative; z-index: 3; }
+            .nav-scrim:not([hidden]) { display: block; position: fixed; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(4, 12, 35, .58); z-index: 1; }
+            .nav-links { position: fixed; inset: 0 0 0 auto; width: min(84vw, 340px); height: 100vh; height: 100dvh; padding: 76px 18px 24px; background: var(--primary-dark); box-shadow: -12px 0 32px rgba(0,0,0,.24); display: flex; flex-direction: column; align-items: stretch; flex-wrap: nowrap; gap: 6px; overflow-y: auto; overscroll-behavior: contain; transform: translateX(105%); visibility: hidden; pointer-events: none; transition: transform .24s ease, visibility .24s; z-index: 2; }
+            .nav-links.open { transform: translateX(0); visibility: visible; pointer-events: auto; }
+            .nav-links a { display: flex; align-items: center; min-height: 44px; padding: 10px 12px; font-size: 1rem; }
+            .nav-links > span { border-left: 0 !important; border-top: 1px solid rgba(255,255,255,.24); height: 1px; margin: 8px 0 !important; }
+            .nav-profile { gap: 10px; }
+            body.nav-open { overflow: hidden; }
+            .container { margin: 20px auto; padding: 0 14px; }
+            .card { padding: 18px; margin-bottom: 18px; }
+            .carousel { height: min(58vh, 360px); min-height: 250px; }
+            .slide { padding: 24px 18px; }
+            .slide h2 { font-size: 1.65rem; }
+            .slide p { font-size: 1rem; }
+            .flex-row { flex-direction: column; align-items: stretch; }
+            .flex-between { align-items: flex-start; }
+            .footer { padding: 28px 16px; margin-top: 28px; }
+        }
         """;
 
     static String page(String title, User user, String activePath, String content) {
@@ -1094,33 +1564,64 @@ public class YEPWebApp {
                 nav(user, activePath) +
                 "<main class='container'>" + flashHtml(sid) + content + "</main>" +
                 "<footer class='footer'>© 2026 Youth Empowerment Project · Built for East Africa</footer>" +
-                "<script>" + CAROUSEL_JS + "</script>" +
+                "<script>" + CAROUSEL_JS + NAV_JS + "</script>" +
                 "</body></html>";
     }
 
     static String nav(User user, String activePath) {
         StringBuilder sb = new StringBuilder();
-        sb.append("<header class='topbar'><a href='/dashboard' class='brand' style='text-decoration:none'>🌍 YEP Platform</a><nav class='nav-links'>");
+        sb.append("<header class='topbar' id='topbar'><a href='/dashboard' class='brand' style='text-decoration:none'>🌍 YEP Platform</a>")
+                .append("<button class='menu-toggle' id='menuToggle' type='button' aria-label='Open navigation menu' aria-controls='siteNav' aria-expanded='false'><span class='menu-icon' aria-hidden='true'><span></span><span></span><span></span></span></button>")
+                .append("<button class='nav-scrim' id='navScrim' type='button' aria-label='Close navigation menu' hidden></button>")
+                .append("<nav class='nav-links' id='siteNav' aria-label='Main navigation'>");
         if (user == null) {
             sb.append("<a href='/' class='").append(activePath.equals("/") ? "active" : "").append("'>Home</a>");
             sb.append("<a href='/login' class='").append(activePath.equals("/login") ? "active" : "").append("'>Sign in</a>");
             sb.append("<a href='/register' class='btn primary small' style='margin-left:8px'>Join YEP</a>");
         } else {
-            sb.append("<a href='/dashboard' class='").append(activePath.equals("/dashboard") ? "active" : "").append("'>Dashboard</a>");
-            sb.append("<a href='/activities' class='").append(activePath.equals("/activities") ? "active" : "").append("'>Activities</a>");
-            sb.append("<a href='/level-one' class='").append(activePath.equals("/level-one") ? "active" : "").append("'>Level 1</a>");
-            sb.append("<a href='/live-session' class='").append(activePath.equals("/live-session") ? "active" : "").append("'>Live Session</a>");
-            sb.append("<a href='/level-two' class='").append(activePath.equals("/level-two") ? "active" : "").append("'>Level 2</a>");
-            sb.append("<a href='/discussion' class='").append(activePath.equals("/discussion") || activePath.equals("/thread") ? "active" : "").append("'>Discussions</a>");
-            sb.append("<a href='/certificate' class='").append(activePath.equals("/certificate") ? "active" : "").append("'>Certificates</a>");
-            if (user.getRole() == UserRole.ADMIN) {
-                sb.append("<a href='/age-verification' class='").append(activePath.equals("/age-verification") ? "active" : "").append("'>Age verification</a>");
+            if (isPendingYouth(user)) {
+                sb.append("<a href='/enrollment' class='").append(activePath.equals("/enrollment") ? "active" : "").append("'>Enrollment</a>");
+            } else {
+                sb.append("<a href='/dashboard' class='").append(activePath.equals("/dashboard") ? "active" : "").append("'>Dashboard</a>");
+                sb.append("<a href='/activities' class='").append(activePath.equals("/activities") ? "active" : "").append("'>Activities</a>");
+            }
+            if (!isLimitedStakeholder(user) && !isPendingYouth(user)) {
+                sb.append("<a href='/level-one' class='").append(activePath.equals("/level-one") ? "active" : "").append("'>Level 1</a>");
+                sb.append("<a href='/live-session' class='").append(activePath.equals("/live-session") ? "active" : "").append("'>Live Session</a>");
+                sb.append("<a href='/level-two' class='").append(activePath.equals("/level-two") ? "active" : "").append("'>Level 2</a>");
+                sb.append("<a href='/discussion' class='").append(activePath.equals("/discussion") || activePath.equals("/thread") ? "active" : "").append("'>Discussions</a>");
+                sb.append("<a href='/certificate' class='").append(activePath.equals("/certificate") ? "active" : "").append("'>Certificates</a>");
+                if (user.getRole() == UserRole.ADMIN) {
+                    sb.append("<a href='/age-verification' class='").append(activePath.equals("/age-verification") ? "active" : "").append("'>Age verification</a>");
+                }
             }
             sb.append("<span style='border-left:1px solid var(--border);margin:0 8px'></span>");
+            sb.append("<a href='/profile' class='nav-profile ").append(activePath.equals("/profile") ? "active" : "").append("'>")
+                    .append(profileAvatarHtml(user)).append("<span>My Profile</span></a>");
             sb.append("<a href='/logout' style='color:var(--danger)'>Logout</a>");
         }
         sb.append("</nav></header>");
         return sb.toString();
+    }
+
+    static boolean isLimitedStakeholder(User user) {
+        return user != null && switch (user.getRole()) {
+            case UNIVERSITY, EMPLOYER, PARTNER, RESEARCHER -> true;
+            default -> false;
+        };
+    }
+
+    static boolean isPendingYouth(User user) {
+        return user instanceof YouthParticipant
+                && "PENDING".equals(YOUTH_AGE_STATUS.get(user.getId()));
+    }
+
+    static String profileAvatarHtml(User user) {
+        String photo = user.getProfile().getPhotoUrl();
+        if (photo != null && photo.startsWith("/profile-photo/")) {
+            return "<img class='nav-avatar' src='" + esc(photo) + "' alt=''>";
+        }
+        return "<span class='nav-avatar' aria-hidden='true'>" + esc(initials(user.getName())) + "</span>";
     }
 
     static String carousel() {
@@ -1161,6 +1662,42 @@ public class YEPWebApp {
             dotsEl.children[i].classList.add('active');
           }
           setInterval(function(){ go(i + 1); }, 5000);
+        })();
+        """;
+
+    static final String NAV_JS = """
+        (function(){
+          var bar=document.getElementById('topbar'),button=document.getElementById('menuToggle');
+          var nav=document.getElementById('siteNav'),scrim=document.getElementById('navScrim');
+          if(!bar||!button||!nav||!scrim)return;
+          var mobile=window.matchMedia('(max-width: 760px)');
+          function setOpen(open,restoreFocus){
+            bar.classList.toggle('nav-open',open);
+            nav.classList.toggle('open',open);
+            button.setAttribute('aria-expanded',String(open));
+            button.setAttribute('aria-label',open?'Close navigation menu':'Open navigation menu');
+            scrim.hidden=!open;
+            document.body.classList.toggle('nav-open',open);
+            if(mobile.matches){
+              nav.setAttribute('aria-hidden',String(!open));
+              if(open)nav.removeAttribute('inert');else nav.setAttribute('inert','');
+            }else{
+              nav.removeAttribute('aria-hidden');
+              nav.removeAttribute('inert');
+            }
+            if(open){var first=nav.querySelector('a');if(first)first.focus();}
+            else if(restoreFocus&&mobile.matches)button.focus();
+          }
+          button.addEventListener('click',function(){setOpen(button.getAttribute('aria-expanded')!=='true',true);});
+          scrim.addEventListener('click',function(){setOpen(false,true);});
+          document.addEventListener('keydown',function(event){
+            if(event.key==='Escape'&&button.getAttribute('aria-expanded')==='true')setOpen(false,true);
+          });
+          nav.addEventListener('click',function(event){
+            if(mobile.matches&&event.target.closest('a'))setOpen(false,false);
+          });
+          mobile.addEventListener('change',function(){setOpen(false,false);});
+          setOpen(false,false);
         })();
         """;
 
@@ -1222,7 +1759,9 @@ public class YEPWebApp {
     }
 
     static Map<String, String> parseForm(HttpExchange ex) throws IOException {
-        return parseQuery(new String(ex.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+        byte[] body = ex.getRequestBody().readNBytes(MAX_FORM_BODY_BYTES + 1);
+        if (body.length > MAX_FORM_BODY_BYTES) throw new RequestTooLargeException();
+        return parseQuery(new String(body, StandardCharsets.UTF_8));
     }
 
     static Map<String, String> parseQuery(String q) {
@@ -1232,8 +1771,10 @@ public class YEPWebApp {
             if (pair.isEmpty()) continue;
             int eq = pair.indexOf('=');
             try {
-                if (eq < 0) map.put(URLDecoder.decode(pair, StandardCharsets.UTF_8), "");
-                else map.put(URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8), URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8));
+                String key = eq < 0 ? URLDecoder.decode(pair, StandardCharsets.UTF_8)
+                        : URLDecoder.decode(pair.substring(0, eq), StandardCharsets.UTF_8);
+                String value = eq < 0 ? "" : URLDecoder.decode(pair.substring(eq + 1), StandardCharsets.UTF_8);
+                map.merge(key, value, (existing, next) -> existing + "," + next);
             } catch (Exception ignored) {}
         }
         return map;
@@ -1274,20 +1815,17 @@ public class YEPWebApp {
             LearningActivity ai101 = LEARNING.create(1, "AI Literacy Fundamentals", "Responsible AI, misinformation and critical thinking", ActivityType.SELF_PACED, "AI Literacy", LocalDate.now(), LocalDate.now().plusDays(14), "https://content.yep.ug/ai101", david.getId());
             LearningActivity story = LEARNING.create(1, "Digital Storytelling Workshop", "Video, audio and written storytelling for impact", ActivityType.WORKSHOP, "Media Literacy", LocalDate.now(), LocalDate.now().plusDays(21), "https://content.yep.ug/story", david.getId());
             LearningActivity live = LEARNING.create(1, "Intercultural Communication Live", "Live virtual exchange with peers in Kenya and Tanzania", ActivityType.LIVE_SESSION, "Intercultural Communication", LocalDate.now().plusDays(3), LocalDate.now().plusDays(3), "https://content.yep.ug/ic-live", david.getId());
-            LEARNING.create(1, "Mastering Generative AI Tools", "Hands-on session with ChatGPT and Midjourney for digital creators.", ActivityType.SELF_PACED, "AI Literacy", LocalDate.now(), LocalDate.now().plusDays(30), "https://content.yep.ug/genai", david.getId());
-            LEARNING.create(1, "Fighting Misinformation in East Africa", "Critical thinking and fact-checking strategies for social media.", ActivityType.LIVE_SESSION, "Media Literacy", LocalDate.now().plusDays(2), LocalDate.now().plusDays(2), "https://content.yep.ug/factcheck", david.getId());
+            LearningActivity genAi = LEARNING.create(1, "Mastering Generative AI Tools", "Hands-on session with ChatGPT and Midjourney for digital creators.", ActivityType.SELF_PACED, "AI Literacy", LocalDate.now(), LocalDate.now().plusDays(30), "https://content.yep.ug/genai", david.getId());
+            LearningActivity factcheck = LEARNING.create(1, "Fighting Misinformation in East Africa", "Critical thinking and fact-checking strategies for social media.", ActivityType.LIVE_SESSION, "Media Literacy", LocalDate.now().plusDays(2), LocalDate.now().plusDays(2), "https://content.yep.ug/factcheck", david.getId());
 
             // Level 2 Activity
             LearningActivity l2Agri = LEARNING.create(2, "Level Two: AgriTech Impact Teams", "Team-based impact project development in agriculture", ActivityType.VIRTUAL_EXCHANGE, "Agriculture", LocalDate.now(), LocalDate.now().plusDays(60), "https://content.yep.ug/l2-agri", david.getId());
 
-            // Enrollments
-            LEARNING.enroll(alice, ai101);
-            LEARNING.enroll(bob, ai101);
-
-            // Level 2 Setup
-            alice.setLevelTwoEligible(true);
-            bob.setLevelTwoEligible(true);
-            charlie.setLevelTwoEligible(true);
+            // Seed users have completed the full Level One path so the Level Two demo remains available.
+            List<LearningActivity> levelOneActivities = List.of(ai101, story, live, genAi, factcheck);
+            completeSeedLevelOne(alice, levelOneActivities);
+            completeSeedLevelOne(bob, levelOneActivities);
+            completeSeedLevelOne(charlie, levelOneActivities);
 
             Team agri = TEAM_SVC.createTeam("Agri Innovators", l2Agri.getId(), alice);
             TEAM_SVC.addMember(agri, bob);
@@ -1315,13 +1853,28 @@ public class YEPWebApp {
             System.out.println("[seed] " + USERS.findAll().size() + " users, " + ACTIVITIES.findAll().size() + " activities, " + TEAMS.findAll().size() + " team(s), " + THREADS.findAll().size() + " thread(s), " + CERTS.findAll().size() + " certificate(s)");
         } catch (Exception e) { e.printStackTrace(); }
     }
+
+    static void completeSeedLevelOne(User user, List<LearningActivity> activities) {
+        for (LearningActivity activity : activities) {
+            Enrollment enrollment = LEARNING.enroll(user, activity);
+            enrollment.updateProgress(100);
+        }
+        if (user instanceof YouthParticipant youth) youth.setLevelTwoEligible(true);
+    }
 }
 
 // ============================================================================
 // ENUMS, EXCEPTIONS, UTILS, MODELS, FACTORIES, STRATEGIES, REPOS, SERVICES
 // ============================================================================
 
-enum UserRole { YOUTH("Youth Participant"), FACILITATOR("Facilitator"), MENTOR("Mentor"), ADMIN("Administrator"), PARTNER("Partner Organisation"); private final String label; UserRole(String l) { this.label = l; } public String getLabel() { return label; } }
+enum UserRole {
+    YOUTH("Youth Participant"), FACILITATOR("Facilitator / Lecturer"), MENTOR("Mentor"),
+    UNIVERSITY("University / Educational Institution"), EMPLOYER("Employer"),
+    PARTNER("Partner Organisation"), RESEARCHER("Researcher / Student"), ADMIN("Administrator");
+    private final String label;
+    UserRole(String label) { this.label = label; }
+    public String getLabel() { return label; }
+}
 enum AccountStatus { PENDING, ACTIVE, SUSPENDED }
 enum ActivityType { LIVE_SESSION, SELF_PACED, WORKSHOP, VIRTUAL_EXCHANGE }
 enum ActivityLevel { LEVEL_ONE(1, "Level One"), LEVEL_TWO(2, "Level Two"); private final int value; private final String desc; ActivityLevel(int v, String d) { this.value = v; this.desc = d; } public int getValue() { return value; } public String getDescription() { return desc; } public static ActivityLevel fromInt(int v) { return v == 1 ? LEVEL_ONE : LEVEL_TWO; } }
@@ -1333,6 +1886,7 @@ enum NotificationType { EMAIL, SMS, IN_APP }
 class YepException extends RuntimeException { public YepException(String m) { super(m); } public YepException(String m, Throwable c) { super(m, c); } }
 class ValidationException extends YepException { public ValidationException(String m) { super(m); } }
 class AuthenticationException extends YepException { public AuthenticationException(String m) { super(m); } }
+class RequestTooLargeException extends IOException { public RequestTooLargeException() { super("Form request exceeds the supported size."); } }
 
 final class ValidationUtil {
     private ValidationUtil() {}
@@ -1434,6 +1988,22 @@ class PartnerOrganisation extends User {
     @Override public boolean isEligibleForLevelTwo() { return false; }
     @Override public String getDashboardSummary() { return "Partner · " + getName() + (orgType != null ? " (" + orgType + ")" : ""); }
     public String getOrgType() { return orgType; } public void setOrgType(String v) { this.orgType = v; }
+}
+class StakeholderAccount extends User {
+    private final UserRole role;
+    private String organisation, expertise;
+    public StakeholderAccount(String n, String e, String p, UserRole role) {
+        super(n, e, p);
+        if (role != UserRole.UNIVERSITY && role != UserRole.EMPLOYER && role != UserRole.RESEARCHER) {
+            throw new ValidationException("Unsupported stakeholder account type.");
+        }
+        this.role = role;
+    }
+    @Override public UserRole getRole() { return role; }
+    @Override public boolean isEligibleForLevelTwo() { return false; }
+    @Override public String getDashboardSummary() { return role.getLabel() + (organisation == null || organisation.isBlank() ? "" : " · " + organisation); }
+    public String getOrganisation() { return organisation; } public void setOrganisation(String v) { this.organisation = v; }
+    public String getExpertise() { return expertise; } public void setExpertise(String v) { this.expertise = v; }
 }
 
 abstract class LearningActivity extends BaseEntity {
@@ -1567,7 +2137,12 @@ final class UserFactory {
     private UserFactory() {}
     static User create(String roleName, String name, String email, String phone) {
         return switch (UserRole.valueOf(roleName)) {
-            case YOUTH -> new YouthParticipant(name, email, phone); case FACILITATOR -> new Facilitator(name, email, phone); case MENTOR -> new Mentor(name, email, phone); case ADMIN -> new Administrator(name, email, phone); case PARTNER -> new PartnerOrganisation(name, email, phone);
+            case YOUTH -> new YouthParticipant(name, email, phone);
+            case FACILITATOR -> new Facilitator(name, email, phone);
+            case MENTOR -> new Mentor(name, email, phone);
+            case UNIVERSITY, EMPLOYER, RESEARCHER -> new StakeholderAccount(name, email, phone, UserRole.valueOf(roleName));
+            case ADMIN -> new Administrator(name, email, phone);
+            case PARTNER -> new PartnerOrganisation(name, email, phone);
         };
     }
 }
@@ -1613,6 +2188,8 @@ class AuthService {
         }
         if (u instanceof Mentor m) { m.setExpertise(expertise); m.setOrganisation(organisation); }
         if (u instanceof Facilitator f) { f.setExpertise(expertise); }
+        if (u instanceof PartnerOrganisation p) p.setOrgType(organisation);
+        if (u instanceof StakeholderAccount s) { s.setOrganisation(organisation); s.setExpertise(expertise); }
         String salt = PasswordUtil.generateSalt(); u.setPasswordSalt(salt); u.setPasswordHash(PasswordUtil.hash(password, salt)); u.activate();
         return users.save(u);
     }
