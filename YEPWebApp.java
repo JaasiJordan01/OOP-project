@@ -10,7 +10,9 @@ import java.security.MessageDigest;
 import java.security.SecureRandom;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
+import java.time.Period;
 import java.time.format.DateTimeFormatter;
+import java.time.format.DateTimeParseException;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
@@ -45,6 +47,11 @@ public class YEPWebApp {
     static final Map<String, User> SESSIONS = new ConcurrentHashMap<>();
     static final Map<String, String> FLASH_MESSAGES = new ConcurrentHashMap<>();
     static final Map<Long, Set<Long>> LIVE_ATTENDANCE = new ConcurrentHashMap<>();
+    static final Map<Long, String> YOUTH_AGE_STATUS = new ConcurrentHashMap<>();
+    static final Map<Long, LocalDate> YOUTH_DATE_OF_BIRTH = new ConcurrentHashMap<>();
+    static final Map<Long, LocalDate> YOUTH_REGISTERED_ON = new ConcurrentHashMap<>();
+    static final Map<Long, Long> AGE_REVIEWED_BY = new ConcurrentHashMap<>();
+    static final Map<Long, LocalDateTime> AGE_REVIEWED_AT = new ConcurrentHashMap<>();
 
     // ==================== SERVICES ====================
     static final AuthService        AUTH     = new AuthService(USERS);
@@ -91,6 +98,16 @@ public class YEPWebApp {
                 case "/register"    -> { if (method.equals("POST")) registerPost(ex); else registerGet(ex, null); }
                 case "/login"       -> { if (method.equals("POST")) loginPost(ex);    else loginGet(ex, null); }
                 case "/logout"      -> logout(ex);
+                case "/age-verification" -> {
+                    if (method.equals("GET")) ageVerificationGet(ex, user);
+                    else sendHtml(ex, 405, page("Method not allowed", user, "/age-verification",
+                            "<div class='card'><h1>Method not allowed</h1></div>"));
+                }
+                case "/age-verification/review" -> {
+                    if (method.equals("POST")) ageVerificationReviewPost(ex, user);
+                    else sendHtml(ex, 405, page("Method not allowed", user, "/age-verification",
+                            "<div class='card'><h1>Method not allowed</h1></div>"));
+                }
                 case "/dashboard"   -> dashboard(ex, user);
                 case "/activities"  -> activities(ex, user);
                 case "/enroll"      -> enroll(ex, user);
@@ -129,76 +146,105 @@ public class YEPWebApp {
                 "<div class='card text-center'><h2 style='font-size:2rem'>💬</h2><h3>Discussions</h3><p class='muted'>Ask questions, share ideas, and get guidance from mentors and facilitators.</p></div>" +
                 "<div class='card text-center'><h2 style='font-size:2rem'>🏅</h2><h3>Certificates</h3><p class='muted'>Verifiable digital certificates that universities and employers can trust.</p></div>" +
             "</section>" +
-            "<div class='card text-center mt-4' style='background:linear-gradient(135deg,#0a6e3a,#064a27);color:#fff;border:none'>" +
+            "<div class='card text-center mt-4' style='background:linear-gradient(135deg,#0a1f5c,#1d4ed8);color:#fff;border:none'>" +
                 "<h2 style='color:#fff'>Ready to join the exchange?</h2>" +
                 "<p style='opacity:0.9;margin-bottom:20px'>Learn together. Build together. Get recognised.</p>" +
-                "<a class='btn' style='background:#fff;color:#064a27;border:none;margin-right:10px' href='/register'>Create account</a> " +
+                "<a class='btn' style='background:#fbbf24;color:#0a1f5c;border:none;margin-right:10px' href='/register'>Create account</a> " +
                 "<a class='btn' style='background:transparent;color:#fff;border:1px solid #fff' href='/login'>Sign in</a>" +
             "</div>";
         sendHtml(ex, 200, page("Welcome", user, "/", content));
     }
 
     static void registerGet(HttpExchange ex, String error) throws IOException {
-        String err = error == null ? "" : "<div class='alert error'>" + esc(error) + "</div>";
-        String content =
-            "<div class='auth-box card'>" +
-                "<h2 class='text-center mb-4'>Create your YEP account</h2>" + err +
-                "<form method='post' action='/register'>" +
-                    "<label>I am a...</label>" +
-                    "<select name='role' id='role' onchange='toggleRoleFields()' required>" +
-                        "<option value='YOUTH'>Youth Participant (18–35)</option>" +
-                        "<option value='MENTOR'>Mentor</option>" +
-                        "<option value='FACILITATOR'>Facilitator</option>" +
-                    "</select>" +
-                    "<div class='grid-2'>" +
-                        "<div><label>Full name</label><input name='name' required></div>" +
-                        "<div><label>Email</label><input type='email' name='email' required></div>" +
-                    "</div>" +
-                    "<div class='grid-2'>" +
-                        "<div><label>Phone</label><input name='phone'></div>" +
-                        "<div><label>Password</label><input type='password' name='password' minlength='6' required></div>" +
-                    "</div>" +
-                    "<div id='youthFields' class='mt-4'>" +
-                        "<div class='grid-2'>" +
-                            "<div><label>Age (18–35)</label><input type='number' name='age' min='18' max='35'></div>" +
-                            "<div><label>Gender</label><select name='gender'><option value=''>Select…</option><option>Female</option><option>Male</option><option>Other</option></select></div>" +
-                        "</div>" +
-                        "<div class='grid-2'>" +
-                            "<div><label>Country</label><select name='country'><option value=''>Select…</option>" + dropdownOptions(new String[]{"Uganda","Kenya","Tanzania","Rwanda","Burundi","South Sudan","Ethiopia","Somalia"}) + "</select></div>" +
-                            "<div><label>District</label><input name='district' placeholder='e.g. Kampala'></div>" +
-                        "</div>" +
-                        "<label>Highest education</label><select name='education'><option value=''>Select…</option>" + dropdownOptions(new String[]{"Secondary","Certificate","Diploma","Bachelor's Degree","Master's Degree","Other"}) + "</select>" +
-                    "</div>" +
-                    "<div id='mentorFields' style='display:none' class='mt-4'>" +
-                        "<div class='grid-2'>" +
-                            "<div><label>Area of expertise</label><select name='expertise'><option value=''>Select…</option>" + dropdownOptions(new String[]{"Digital Literacy","AI Ethics","AgriTech","HealthTech","Climate & Sustainability","Entrepreneurship","Education","Media & Journalism"}) + "</select></div>" +
-                            "<div><label>Organisation</label><input name='organisation'></div>" +
-                        "</div>" +
-                    "</div>" +
-                    "<button class='btn primary mt-4' type='submit' style='width:100%'>Create account</button>" +
-                "</form>" +
-                "<p class='muted text-center mt-4'>Already have an account? <a href='/login'>Sign in</a></p>" +
-            "</div>" +
-            "<script>" +
-                "function toggleRoleFields(){" +
-                    "var r=document.getElementById('role').value;" +
-                    "document.getElementById('youthFields').style.display=r==='YOUTH'?'block':'none';" +
-                    "document.getElementById('mentorFields').style.display=(r==='MENTOR'||r==='FACILITATOR')?'block':'none';" +
-                "}" +
-                "toggleRoleFields();" +
-            "</script>";
-        sendHtml(ex, 200, page("Register", null, "/register", content));
+        LocalDate today = LocalDate.now();
+        String latestDob = today.minusYears(18).toString();
+        String earliestDob = today.minusYears(36).plusDays(1).toString();
+        String errorHtml = error == null ? "" : "<p class='err'>" + esc(error) + "</p>";
+        String content = """
+            <form class="form" method="post" action="/register">
+              <h1>Create Account</h1>
+              <p class="sub">Start your journey with YEP</p>
+              %s
+              <label class="fld"><span aria-hidden="true">👤</span><input name="name" required placeholder="Full Name" autocomplete="name"></label>
+              <label class="fld"><span aria-hidden="true">✉️</span><input type="email" name="email" required placeholder="Email Address" autocomplete="email"></label>
+              <label class="fld"><span aria-hidden="true">📞</span><input type="tel" name="phone" placeholder="Phone Number" autocomplete="tel"></label>
+              <label class="fld"><span aria-hidden="true">🎓</span><select name="role" id="role" aria-label="Account type" onchange="toggleRoleFields()" required>
+                <option value="YOUTH">Youth Participant (18–35)</option>
+                <option value="MENTOR">Mentor</option>
+                <option value="FACILITATOR">Facilitator</option>
+              </select></label>
+              <div id="youthFields" class="auth-fields">
+                <label class="fld"><span aria-hidden="true">🎂</span><input type="date" id="dob" name="dob" min="%s" max="%s" required aria-label="Date of birth"></label>
+                <p class="hint">Enter your real date of birth. YEP calculates your age on the server. Youth accounts stay pending until an administrator checks proof of age.</p>
+                <div class="auth-grid">
+                  <label class="fld"><span aria-hidden="true">⚧</span><select name="gender" aria-label="Gender"><option value="">Gender (optional)</option><option>Female</option><option>Male</option><option>Other</option></select></label>
+                  <label class="fld"><span aria-hidden="true">🌍</span><select name="country" aria-label="Country"><option value="">Country</option>%s</select></label>
+                </div>
+                <label class="fld"><span aria-hidden="true">📍</span><input name="district" placeholder="District" autocomplete="address-level2"></label>
+                <label class="fld"><span aria-hidden="true">📚</span><select name="education" aria-label="Highest education"><option value="">Highest education (optional)</option>%s</select></label>
+              </div>
+              <div id="mentorFields" class="auth-fields" style="display:none">
+                <label class="fld"><span aria-hidden="true">✨</span><select name="expertise" aria-label="Area of expertise"><option value="">Area of expertise</option>%s</select></label>
+                <label class="fld"><span aria-hidden="true">🏢</span><input name="organisation" placeholder="Organisation"></label>
+              </div>
+              <label class="fld"><span aria-hidden="true">🔒</span><input type="password" name="password" required minlength="8" placeholder="Password (at least 8 characters)" autocomplete="new-password"></label>
+              <label class="fld"><span aria-hidden="true">🔒</span><input type="password" name="confirmPassword" required minlength="8" placeholder="Confirm Password" autocomplete="new-password"></label>
+              <label class="terms"><input type="checkbox" name="terms" value="accepted" required><span>I agree to the Terms &amp; Conditions and Privacy Policy.</span></label>
+              <button class="btn primary full" type="submit">Create Account →</button>
+              <div class="ctr">Already have an account? <a href="/login">Sign In</a></div>
+              <div class="copy">© 2026 YEP. All rights reserved.</div>
+            </form>
+            <script>
+              function toggleRoleFields(){
+                var youth=document.getElementById('role').value==='YOUTH';
+                document.getElementById('youthFields').style.display=youth?'grid':'none';
+                document.getElementById('mentorFields').style.display=youth?'none':'grid';
+                document.getElementById('dob').required=youth;
+              }
+              toggleRoleFields();
+            </script>
+            """.formatted(errorHtml, earliestDob, latestDob,
+                dropdownOptions(new String[]{"Uganda","Kenya","Tanzania","Rwanda","Burundi","South Sudan","Ethiopia","Somalia"}),
+                dropdownOptions(new String[]{"Secondary","Certificate","Diploma","Bachelor's Degree","Master's Degree","Other"}),
+                dropdownOptions(new String[]{"Digital Literacy","AI Ethics","AgriTech","HealthTech","Climate & Sustainability","Entrepreneurship","Education","Media & Journalism"}));
+        sendHtml(ex, 200, authPage("Create Account", "Together<br>We Grow<br><b>Stronger</b>",
+                "Join the YEP community and unlock opportunities for learning, skills and impact.", content));
     }
 
     static void registerPost(HttpExchange ex) throws IOException {
         Map<String, String> f = parseForm(ex);
         try {
+            String role = f.get("role");
+            if (role == null || !List.of("YOUTH", "MENTOR", "FACILITATOR").contains(role)) {
+                throw new ValidationException("Choose a supported registration type.");
+            }
+            if (!"accepted".equals(f.get("terms"))) throw new ValidationException("Please accept the Terms & Conditions and Privacy Policy.");
+            if (!Objects.equals(f.get("password"), f.get("confirmPassword"))) throw new ValidationException("Passwords do not match.");
+            LocalDate dob = null;
+            Integer age = null;
+            if ("YOUTH".equalsIgnoreCase(f.get("role"))) {
+                dob = parseDateOfBirth(f.get("dob"));
+                age = ageOn(dob, LocalDate.now());
+            }
             User u = AUTH.register(
                 f.get("role"), f.get("name"), f.get("email"), f.get("phone"), f.get("password"),
-                parseIntOrNull(f.get("age")), f.get("gender"), f.get("country"),
+                age, f.get("gender"), f.get("country"),
                 f.get("district"), f.get("education"),
                 f.get("expertise"), f.get("organisation")
             );
+            if (u instanceof YouthParticipant) {
+                u.suspend();
+                YOUTH_AGE_STATUS.put(u.getId(), "PENDING");
+                YOUTH_DATE_OF_BIRTH.put(u.getId(), dob);
+                YOUTH_REGISTERED_ON.put(u.getId(), LocalDate.now());
+                String pending = "<div class='auth-message'><div class='auth-symbol'>✓</div><h1>Registration received</h1>"
+                        + "<p>Your age is within the programme range. An administrator must review proof of age before you can sign in.</p>"
+                        + "<p>For your privacy, YEP does not ask you to upload an identity document. Please present an official proof of age to the YEP team.</p>"
+                        + "<a class='btn primary full' href='/login'>Continue to sign in</a></div>";
+                sendHtml(ex, 200, authPage("Registration received", "Your YEP journey<br><b>starts here</b>",
+                        "A quick age check helps keep the youth programme safe and fair.", pending));
+                return;
+            }
             String sid = UUID.randomUUID().toString();
             SESSIONS.put(sid, u);
             setSessionCookie(ex, sid);
@@ -210,27 +256,31 @@ public class YEPWebApp {
     }
 
     static void loginGet(HttpExchange ex, String error) throws IOException {
-        String err = error == null ? "" : "<div class='alert error'>" + esc(error) + "</div>";
-        String content =
-            "<div class='auth-box card'>" +
-                "<h2 class='text-center mb-4'>Welcome back</h2>" + err +
-                "<form method='post' action='/login'>" +
-                    "<label>Email</label><input type='email' name='email' required>" +
-                    "<label>Password</label><input type='password' name='password' required>" +
-                    "<button class='btn primary mt-4' type='submit' style='width:100%'>Sign in</button>" +
-                "</form>" +
-                "<div class='alert mt-4' style='background:#f8fafc;border:1px solid #e2e8f0;font-size:0.85rem'>" +
-                    "<strong>Demo accounts (password = 'password'):</strong><br>" +
-                    "alice@yep.ug · bob@yep.ug · grace@yep.ug · david@yep.ug · admin@yep.ug" +
-                "</div>" +
-            "</div>";
-        sendHtml(ex, 200, page("Login", null, "/login", content));
+        String errorHtml = error == null ? "" : "<p class='err'>" + esc(error) + "</p>";
+        String content = """
+            <form class="form" method="post" action="/login">
+              <h1>Welcome Back</h1>
+              <p class="sub">Sign in to your account to continue</p>
+              %s
+              <label class="fld"><span aria-hidden="true">✉️</span><input type="email" name="email" required placeholder="Email Address" autocomplete="email"></label>
+              <label class="fld"><span aria-hidden="true">🔒</span><input type="password" name="password" required placeholder="Password" autocomplete="current-password"></label>
+              <button class="btn primary full" type="submit">Sign In →</button>
+              <div class="ctr">Don’t have an account? <a href="/register">Sign Up</a></div>
+              <div class="copy">© 2026 YEP. All rights reserved.</div>
+            </form>
+            """.formatted(errorHtml);
+        sendHtml(ex, 200, authPage("Welcome Back", "Empowering Young People<br><b>Building a Better Tomorrow</b>",
+                "<b>Learn. Grow. Lead.</b> Join a community of empowered youth creating lasting impact.", content));
     }
 
     static void loginPost(HttpExchange ex) throws IOException {
         Map<String, String> f = parseForm(ex);
         try {
             User u = AUTH.login(f.get("email"), f.get("password"));
+            if (u instanceof YouthParticipant && !"VERIFIED".equals(YOUTH_AGE_STATUS.get(u.getId()))) {
+                loginGet(ex, "Your account is awaiting manual age verification.");
+                return;
+            }
             String sid = UUID.randomUUID().toString();
             SESSIONS.put(sid, u);
             setSessionCookie(ex, sid);
@@ -239,6 +289,109 @@ public class YEPWebApp {
         } catch (Exception e) {
             loginGet(ex, e.getMessage());
         }
+    }
+
+    static void ageVerificationGet(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        if (user.getRole() != UserRole.ADMIN) {
+            sendHtml(ex, 403, page("Forbidden", user, "/age-verification",
+                    "<div class='card'><h1>Administrator access required</h1></div>"));
+            return;
+        }
+
+        List<User> pending = USERS.findAll().stream()
+                .filter(u -> u instanceof YouthParticipant)
+                .filter(u -> "PENDING".equals(YOUTH_AGE_STATUS.get(u.getId())))
+                .collect(Collectors.toList());
+        StringBuilder rows = new StringBuilder();
+        if (pending.isEmpty()) {
+            rows.append("<div class='empty-state'><p>No youth registrations are awaiting age review.</p></div>");
+        } else {
+            for (User applicant : pending) {
+                YouthParticipant youth = (YouthParticipant) applicant;
+                LocalDate dob = YOUTH_DATE_OF_BIRTH.get(youth.getId());
+                rows.append("<div class='card'><div class='flex-between'><div><h2>")
+                        .append(esc(youth.getName())).append("</h2><p class='muted'>").append(esc(youth.getEmail()))
+                        .append("</p></div><span class='badge warning'>Pending review</span></div>")
+                        .append("<p><strong>Date of birth:</strong> ").append(fmtDate(dob))
+                        .append(" &nbsp; <strong>Calculated age:</strong> ").append(youth.getAge()).append("</p>")
+                        .append("<p class='muted'>Compare the birth date with official proof of age presented to the YEP team. Do not copy or upload the document.</p>")
+                        .append("<form method='post' action='/age-verification/review' class='flex-row'>")
+                        .append("<input type='hidden' name='userId' value='").append(youth.getId()).append("'>")
+                        .append("<button class='btn primary' type='submit' name='decision' value='approve'>Proof checked — approve</button>")
+                        .append("<button class='btn' type='submit' name='decision' value='reject' style='color:#dc2626'>Reject registration</button>")
+                        .append("</form></div>");
+            }
+        }
+        String content = "<div class='page-header'><h1>Youth age verification</h1>"
+                + "<p class='muted'>Review proof of age before allowing a youth participant to sign in.</p></div>"
+                + "<div class='alert' style='background:#dbe7ff;border:1px solid #c5d6ff'>"
+                + "Only view an official document with the applicant. Do not request or retain document numbers, scans, or photos.</div>"
+                + rows;
+        sendHtml(ex, 200, page("Age Verification", user, "/age-verification", content));
+    }
+
+    static void ageVerificationReviewPost(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        if (user.getRole() != UserRole.ADMIN) {
+            sendHtml(ex, 403, page("Forbidden", user, "/age-verification",
+                    "<div class='card'><h1>Administrator access required</h1></div>"));
+            return;
+        }
+        Map<String, String> form = parseForm(ex);
+        try {
+            long userId = Long.parseLong(form.getOrDefault("userId", ""));
+            User applicant = USERS.findById(userId)
+                    .filter(u -> u instanceof YouthParticipant)
+                    .filter(u -> "PENDING".equals(YOUTH_AGE_STATUS.get(u.getId())))
+                    .orElseThrow(() -> new ValidationException("Pending registration not found."));
+            String decision = form.get("decision");
+            if ("approve".equals(decision)) {
+                LocalDate dob = YOUTH_DATE_OF_BIRTH.get(userId);
+                LocalDate registeredOn = YOUTH_REGISTERED_ON.get(userId);
+                if (dob == null || registeredOn == null) {
+                    throw new ValidationException("Age verification details are unavailable; registration cannot be approved.");
+                }
+                int age = ageOn(dob, registeredOn);
+                ((YouthParticipant) applicant).setAge(age);
+                applicant.activate();
+                YOUTH_AGE_STATUS.put(userId, "VERIFIED");
+                YOUTH_DATE_OF_BIRTH.remove(userId);
+                YOUTH_REGISTERED_ON.remove(userId);
+                AGE_REVIEWED_BY.put(userId, user.getId());
+                AGE_REVIEWED_AT.put(userId, LocalDateTime.now());
+                setFlash(ex, "Age verified. " + applicant.getName() + " can now sign in.");
+            } else if ("reject".equals(decision)) {
+                USERS.delete(userId);
+                YOUTH_AGE_STATUS.remove(userId);
+                YOUTH_DATE_OF_BIRTH.remove(userId);
+                YOUTH_REGISTERED_ON.remove(userId);
+                AGE_REVIEWED_BY.remove(userId);
+                AGE_REVIEWED_AT.remove(userId);
+                setFlash(ex, "Registration rejected and pending account data deleted.");
+            } else {
+                throw new ValidationException("Choose approve or reject.");
+            }
+        } catch (Exception e) {
+            setFlash(ex, e.getMessage(), true);
+        }
+        redirect(ex, "/age-verification");
+    }
+
+    static LocalDate parseDateOfBirth(String value) {
+        if (value == null || value.isBlank()) throw new ValidationException("Date of birth is required for youth registration.");
+        try {
+            return LocalDate.parse(value);
+        } catch (DateTimeParseException e) {
+            throw new ValidationException("Enter a valid date of birth.");
+        }
+    }
+
+    static int ageOn(LocalDate dob, LocalDate asOf) {
+        if (dob == null || dob.isAfter(asOf)) throw new ValidationException("Date of birth cannot be in the future.");
+        int age = Period.between(dob, asOf).getYears();
+        if (age < 18 || age > 35) throw new ValidationException("Youth participants must be 18–35 on the registration date.");
+        return age;
     }
 
     static void logout(HttpExchange ex) throws IOException {
@@ -754,7 +907,7 @@ public class YEPWebApp {
             html.append("<div class='empty-state'><p>You haven't earned any certificates yet.</p><p class='muted'>Complete a Level 1 quiz or a Level 2 project to earn one.</p></div>");
         } else {
             for (Certificate c : certs) {
-                html.append("<div class='card' style='border-left:6px solid #f4c430;background:linear-gradient(to right, #ffffff, #fffdf5)'>")
+                html.append("<div class='card' style='border-left:6px solid #fbbf24;background:linear-gradient(to right, #ffffff, #fffdf5)'>")
                     .append("<h2 class='mb-1'>").append(esc(c.getTitle())).append("</h2>")
                     .append("<p class='mb-1'>Awarded to <strong>").append(esc(c.getParticipantName())).append("</strong></p>")
                     .append("<p class='muted' style='font-family:monospace;font-size:0.9rem'>Certificate ID: ").append(c.getCertificateNumber()).append("</p>")
@@ -779,15 +932,83 @@ public class YEPWebApp {
 
     // ==================== HTML HELPERS & UI TEMPLATE ====================
 
+    static final String AUTH_CSS = """
+        :root{--navy:#0a1f5c;--navy2:#071544;--royal:#1d4ed8;--yel:#fbbf24;--bg:#eef2fb;--card:#fff;--tx:#0f1b3d;--mut:#64708f;--bd:#e3e8f4;--soft:#eaf0ff}
+        @media(prefers-color-scheme:dark){:root{--bg:#0b1226;--card:#131c36;--tx:#e8ecf8;--mut:#9aa6c6;--bd:#233055;--soft:#1a2547}}
+        *{box-sizing:border-box}
+        body{margin:0;background:var(--bg);color:var(--tx);font:15px/1.5 "Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif}
+        a{color:var(--royal);text-decoration:none;font-weight:600}
+        :focus-visible{outline:3px solid var(--yel);outline-offset:2px}
+        .auth{min-height:100vh;display:grid;place-items:center;padding:24px;background:linear-gradient(135deg,var(--soft),var(--bg))}
+        .acard{display:grid;grid-template-columns:5fr 6fr;width:min(1000px,100%);background:var(--card);border-radius:24px;overflow:hidden;box-shadow:0 24px 60px rgba(10,31,92,.2)}
+        .hero1{position:relative;background:linear-gradient(170deg,var(--navy),var(--navy2));color:#fff;padding:34px 32px 0;display:flex;flex-direction:column;gap:16px;overflow:hidden;min-height:600px}
+        .logo{display:flex;align-items:center;gap:10px;color:#fff}
+        .logo b{font-size:30px;letter-spacing:1px;line-height:1;display:block}
+        .logo small{display:block;font-size:11px;color:#c9d4f5;line-height:1.25;margin-top:3px}
+        .logo svg{flex:none}
+        .hero1 h2{font-size:30px;line-height:1.15;margin:8px 0 0}
+        .hero1 h2 b{color:var(--yel)}
+        .hero1 p{color:#d3dcf7;font-size:14px;max-width:32ch;margin:0}
+        .hero1 p b{display:block;color:#fff;font-size:15px}
+        .sw{position:absolute;right:-70px;bottom:60px;width:300px;height:300px;border-radius:50%;border:30px solid var(--yel);border-left-color:transparent;border-bottom-color:transparent;transform:rotate(-25deg)}
+        .crowd{margin-top:auto;position:relative;z-index:1;height:170px;display:flex;align-items:flex-end;justify-content:center;margin-inline:-32px;background:linear-gradient(0deg,#1d4ed8 0,transparent 100%)}
+        .crowd span{font-size:84px;line-height:.9;margin:0 -6px}
+        .form{padding:38px 40px 28px;display:flex;flex-direction:column;gap:12px;justify-content:center;min-width:0}
+        .form h1{font-size:30px;color:var(--navy);margin:0}
+        .form .sub{margin:-8px 0 4px;color:var(--mut)}
+        .fld{display:flex;align-items:center;gap:10px;border:1px solid var(--bd);border-radius:12px;padding:0 14px;background:var(--card);margin:0;min-width:0}
+        .fld input,.fld select{flex:1;min-width:0;width:100%;border:0;background:transparent;color:var(--tx);padding:12px 0;outline:0;font:inherit}
+        .fld:focus-within{border-color:var(--royal);box-shadow:0 0 0 3px rgba(29,78,216,.15)}
+        .fld select option{color:#000}
+        .auth-fields{display:grid;gap:10px}
+        .auth-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+        .hint{color:var(--mut);font-size:12px;margin:-4px 2px 0}
+        .terms{display:flex;align-items:flex-start;gap:10px;font-size:13px;line-height:1.4;margin:0}
+        .terms input{width:auto;margin:3px 0 0;accent-color:var(--royal);flex:none}
+        .btn{border:0;border-radius:10px;padding:10px 18px;font:inherit;font-weight:700;background:var(--navy);color:#fff;display:inline-flex;align-items:center;justify-content:center;gap:6px;cursor:pointer}
+        .btn.primary{background:var(--royal);color:#fff}
+        .btn.full{width:100%;padding:13px}
+        .btn:hover{filter:brightness(.95);text-decoration:none}
+        .err{color:#dc2626;font-size:13px;min-height:18px;margin:0}
+        .ctr{text-align:center;font-size:14px}
+        .copy{text-align:center;color:var(--mut);font-size:12px;margin-top:auto;padding-top:6px}
+        .auth-message{padding:48px 40px;display:flex;flex-direction:column;justify-content:center;gap:16px}
+        .auth-message h1{font-size:30px;color:var(--navy);margin:0}
+        .auth-message p{margin:0;color:var(--mut)}
+        .auth-symbol{width:48px;height:48px;border-radius:50%;display:grid;place-items:center;background:#dcfce7;color:#16a34a;font-size:26px;font-weight:800}
+        @media(prefers-color-scheme:dark){.form h1,.auth-message h1{color:#fff}}
+        @media(max-width:760px){.auth{padding:14px}.acard{grid-template-columns:1fr}.hero1{min-height:0;padding:24px 22px 0}.hero1 h2{font-size:24px}.crowd{height:92px}.crowd span{font-size:56px}.sw{display:none}.form{padding:26px 22px 20px}.auth-message{padding:30px 22px}.auth-grid{grid-template-columns:1fr}}
+        """;
+
+    static String authPage(String title, String heading, String description, String form) {
+        return "<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+                + "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+                + "<title>" + esc(title) + " — YEP</title><style>" + AUTH_CSS + "</style></head><body>"
+                + "<div class='auth'><div class='acard'><section class='hero1'>"
+                + "<div class='logo'><svg viewBox='0 0 40 40' width='42' height='42' aria-hidden='true'>"
+                + "<rect width='40' height='40' rx='12' fill='#1d4ed8'/><path d='M8 29 20 9l12 20' stroke='#fbbf24' stroke-width='4.5' fill='none' stroke-linecap='round' stroke-linejoin='round'/>"
+                + "<circle cx='20' cy='27.5' r='3.2' fill='#fff'/><circle cx='31' cy='9' r='2.2' fill='#fbbf24'/></svg>"
+                + "<div><b>YEP</b><small>Youth Empowerment<br>Management System</small></div></div>"
+                + "<h2>" + heading + "</h2><p>" + description + "</p><div class='sw'></div>"
+                + "<div class='crowd' aria-hidden='true'><span>👩🏿</span><span>👨🏿</span><span>👩🏾</span></div>"
+                + "</section>" + form + "</div></div></body></html>";
+    }
+
     static final String CSS = """
         :root {
-            --primary: #0a6e3a; --primary-dark: #064a27; --primary-light: #e5f4ea;
-            --bg: #f8fafc; --card: #ffffff; --text: #1e293b; --text-muted: #64748b;
-            --border: #e2e8f0; --danger: #ef4444; --warning: #f59e0b;
-            --radius: 10px; --shadow: 0 1px 3px 0 rgba(0,0,0,0.1), 0 1px 2px -1px rgba(0,0,0,0.1);
+            --primary: #1d4ed8; --primary-dark: #0a1f5c; --primary-light: #dbe7ff;
+            --bg: #eef2fb; --card: #ffffff; --text: #0f1b3d; --text-muted: #64708f;
+            --border: #e3e8f4; --danger: #dc2626; --warning: #fbbf24;
+            --radius: 16px; --shadow: 0 2px 10px rgba(10,31,92,.05);
+        }
+        @media (prefers-color-scheme: dark) {
+            :root {
+                --bg: #0b1226; --card: #131c36; --text: #e8ecf8; --text-muted: #9aa6c6;
+                --border: #233055; --primary-light: #1a2547; --shadow: 0 2px 10px rgba(0,0,0,.2);
+            }
         }
         * { box-sizing: border-box; }
-        body { margin: 0; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
+        body { margin: 0; font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
         a { color: var(--primary); text-decoration: none; }
         a:hover { text-decoration: underline; }
         h1, h2, h3, h4 { color: var(--text); margin: 0 0 16px 0; font-weight: 600; }
@@ -795,12 +1016,12 @@ public class YEPWebApp {
         p { margin: 0 0 16px 0; }
 
         /* Layout */
-        .topbar { background: var(--card); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; box-shadow: var(--shadow); position: sticky; top: 0; z-index: 100; }
-        .brand { font-weight: 700; font-size: 1.1rem; color: var(--primary-dark); display: flex; align-items: center; gap: 8px; }
+        .topbar { background: var(--primary-dark); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; box-shadow: var(--shadow); position: sticky; top: 0; z-index: 100; }
+        .brand { font-weight: 700; font-size: 1.1rem; color: #fff; display: flex; align-items: center; gap: 8px; }
         .nav-links { display: flex; gap: 8px; flex-wrap: wrap; }
-        .nav-links a { padding: 8px 12px; border-radius: 6px; color: var(--text-muted); font-weight: 500; font-size: 0.9rem; transition: all 0.2s; }
-        .nav-links a:hover { background: var(--bg); color: var(--text); text-decoration: none; }
-        .nav-links a.active { background: var(--primary-light); color: var(--primary-dark); font-weight: 600; }
+        .nav-links a { padding: 8px 12px; border-radius: 10px; color: #c9d4f5; font-weight: 500; font-size: 0.9rem; transition: all 0.2s; }
+        .nav-links a:hover { background: rgba(255,255,255,.08); color: #fff; text-decoration: none; }
+        .nav-links a.active { background: var(--primary); color: #fff; font-weight: 600; }
         .container { max-width: 1100px; margin: 32px auto; padding: 0 20px; }
 
         /* Components */
@@ -809,7 +1030,7 @@ public class YEPWebApp {
         .btn:hover { background: var(--bg); text-decoration: none; }
         .btn:active { transform: scale(0.98); }
         .btn.primary { background: var(--primary); border-color: var(--primary); color: white; }
-        .btn.primary:hover { background: var(--primary-dark); }
+        .btn.primary:hover { background: #1741ba; }
         .btn.small { padding: 6px 12px; font-size: 0.85rem; }
 
         label { display: block; margin-bottom: 6px; font-size: 0.85rem; font-weight: 500; color: var(--text-muted); }
@@ -892,6 +1113,9 @@ public class YEPWebApp {
             sb.append("<a href='/level-two' class='").append(activePath.equals("/level-two") ? "active" : "").append("'>Level 2</a>");
             sb.append("<a href='/discussion' class='").append(activePath.equals("/discussion") || activePath.equals("/thread") ? "active" : "").append("'>Discussions</a>");
             sb.append("<a href='/certificate' class='").append(activePath.equals("/certificate") ? "active" : "").append("'>Certificates</a>");
+            if (user.getRole() == UserRole.ADMIN) {
+                sb.append("<a href='/age-verification' class='").append(activePath.equals("/age-verification") ? "active" : "").append("'>Age verification</a>");
+            }
             sb.append("<span style='border-left:1px solid var(--border);margin:0 8px'></span>");
             sb.append("<a href='/logout' style='color:var(--danger)'>Logout</a>");
         }
@@ -1039,6 +1263,9 @@ public class YEPWebApp {
             YouthParticipant alice = (YouthParticipant) AUTH.register("YOUTH", "Alice Nakato", "alice@yep.ug", "+256770000001", "password", 22, "Female", "Uganda", "Kampala", "BSc Computer Science", null, null);
             YouthParticipant bob = (YouthParticipant) AUTH.register("YOUTH", "Bob Okello", "bob@yep.ug", "+256770000002", "password", 26, "Male", "Uganda", "Gulu", "Diploma in Agriculture", null, null);
             YouthParticipant charlie = (YouthParticipant) AUTH.register("YOUTH", "Charlie Mwangi", "charlie@yep.ke", "+254780000003", "password", 24, "Male", "Kenya", "Nairobi", "BA Communications", null, null);
+            for (YouthParticipant participant : List.of(alice, bob, charlie)) {
+                YOUTH_AGE_STATUS.put(participant.getId(), "VERIFIED");
+            }
             Facilitator david = (Facilitator) AUTH.register("FACILITATOR", "David Ssem", "david@yep.ug", "+256770000005", "password", null, null, null, null, null, "Digital Literacy", null);
             Mentor grace = (Mentor) AUTH.register("MENTOR", "Grace Achieng", "grace@yep.ug", "+256770000004", "password", null, null, null, null, null, "AgriTech", "Makerere University");
             AUTH.register("ADMIN", "YEP Admin", "admin@yep.ug", "+256770000006", "password", null, null, null, null, null, null, null);
@@ -1377,7 +1604,7 @@ class AuthService {
     User register(String role, String name, String email, String phone, String password, Integer age, String gender, String country, String district, String education, String expertise, String organisation) {
         if (ValidationUtil.isBlank(name)) throw new ValidationException("Name required");
         if (!ValidationUtil.isEmail(email)) throw new ValidationException("Invalid email");
-        if (!ValidationUtil.minLength(password, 6)) throw new ValidationException("Password must be ≥ 6 chars");
+        if (!ValidationUtil.minLength(password, 8)) throw new ValidationException("Password must be at least 8 characters.");
         if (users.findAll().stream().anyMatch(u -> u.getEmail().equalsIgnoreCase(email))) throw new ValidationException("Email already registered");
         User u = UserFactory.create(role, name, email, phone);
         if (u instanceof YouthParticipant y) {
