@@ -3,6 +3,7 @@ import com.sun.net.httpserver.HttpServer;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.InetSocketAddress;
+import java.net.URI;
 import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -43,6 +44,7 @@ public class YEPWebApp {
 
     static final Map<String, User> SESSIONS = new ConcurrentHashMap<>();
     static final Map<String, String> FLASH_MESSAGES = new ConcurrentHashMap<>();
+    static final Map<Long, Set<Long>> LIVE_ATTENDANCE = new ConcurrentHashMap<>();
 
     // ==================== SERVICES ====================
     static final AuthService        AUTH     = new AuthService(USERS);
@@ -97,6 +99,12 @@ public class YEPWebApp {
                 case "/team"        -> { if (method.equals("POST")) teamPost(ex, user); else redirect(ex, "/level-two"); }
                 case "/discussion"  -> { if (method.equals("POST")) discussionPost(ex, user); else discussionGet(ex, user); }
                 case "/thread"      -> { if (method.equals("POST")) threadPost(ex, user); else threadGet(ex, user); }
+                case "/live-session" -> { if (method.equals("POST")) liveSessionPost(ex, user); else liveSessionGet(ex, user); }
+                case "/live-session/check-in" -> {
+                    if (method.equals("POST")) liveSessionCheckIn(ex, user);
+                    else sendHtml(ex, 405, page("Method not allowed", user, "/live-session",
+                            "<div class='card'><h1>Method not allowed</h1></div>"));
+                }
                 case "/certificate" -> certificate(ex, user);
                 default             -> sendHtml(ex, 404, page("Not found", user, "/",
                         "<div class='card text-center'><h1>404</h1><p class='muted'>Page not found.</p><a class='btn primary' href='/'>Return Home</a></div>"));
@@ -405,6 +413,23 @@ public class YEPWebApp {
         }
         sb.append("</div>");
 
+        Optional<LearningActivity> liveSession = ACTIVITIES.findAll().stream()
+                .filter(a -> a.getType() == ActivityType.LIVE_SESSION)
+                .findFirst();
+        sb.append("<div class='card'><div class='flex-between mb-4'><h2>Live Virtual Exchange</h2><a class='btn primary small' href='/live-session'>Open live room</a></div>");
+        if (liveSession.isPresent()) {
+            LearningActivity live = liveSession.get();
+            sb.append("<p><strong>").append(esc(live.getTitle())).append("</strong></p>")
+              .append("<p class='muted mb-2'>").append(esc(live.getDescription())).append("</p>")
+              .append("<p class='muted'>Date: ").append(fmtDate(live.getStartDate())).append(" · Category: ").append(esc(live.getCategory())).append("</p>");
+            if (live.getContentUrl() != null && !live.getContentUrl().isBlank()) {
+                sb.append("<p class='mt-2'><a class='btn primary' href='/live-session'>Join now</a></p>");
+            }
+        } else {
+            sb.append("<p class='muted'>There is no live session scheduled right now.</p>");
+        }
+        sb.append("</div>");
+
         sb.append("<div class='card'><div class='flex-between mb-4'><h2>Open Discussions</h2><a class='btn primary small' href='/discussion'>New Post</a></div>");
         List<DiscussionThread> threads = DISCUSS.all();
         if (threads.isEmpty()) sb.append("<p class='muted'>Start the first discussion.</p>");
@@ -581,6 +606,145 @@ public class YEPWebApp {
         redirect(ex, "/thread?id=" + id);
     }
 
+    static void liveSessionGet(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        Optional<LearningActivity> liveOpt = ACTIVITIES.findAll().stream()
+                .filter(a -> a.getType() == ActivityType.LIVE_SESSION)
+                .findFirst();
+        if (liveOpt.isEmpty()) {
+            sendHtml(ex, 200, page("Live Session", user, "/live-session",
+                    "<div class='card'><h1>Live Virtual Exchange</h1><p class='muted'>There is no live session scheduled right now.</p></div>"));
+            return;
+        }
+
+        LearningActivity live = liveOpt.get();
+        LocalDate today = LocalDate.now();
+        LocalDate starts = live.getStartDate();
+        LocalDate ends = live.getEndDate() == null ? starts : live.getEndDate();
+        boolean scheduledToday = starts != null && ends != null && !today.isBefore(starts) && !today.isAfter(ends);
+        boolean ended = ends != null && today.isAfter(ends);
+        boolean enrolled = isEnrolled(user, live);
+        boolean checkedIn = LIVE_ATTENDANCE.getOrDefault(live.getId(), Set.of()).contains(user.getId());
+        int registrations = (int) ENROLLS.findAll().stream()
+                .filter(e -> e.getActivityId().equals(live.getId())).count();
+        int checkIns = LIVE_ATTENDANCE.getOrDefault(live.getId(), Set.of()).size();
+        String roomUrl = safeHttpUrl(live.getContentUrl());
+
+        String status = ended ? "Session ended" : scheduledToday ? "Room open today" : starts == null ? "Date to be confirmed" : "Upcoming";
+        String statusClass = ended ? "badge" : scheduledToday ? "badge success" : "badge warning";
+        StringBuilder content = new StringBuilder("<div class='page-header'><h1>Live Virtual Exchange</h1>")
+                .append("<p class='muted'>Meet learners across East Africa in a scheduled, facilitator-led online session.</p></div>")
+                .append("<div class='card'><div class='flex-between'><h2>").append(esc(live.getTitle())).append("</h2><span class='")
+                .append(statusClass).append("'>").append(esc(status)).append("</span></div>")
+                .append("<p class='muted'>").append(esc(live.getDescription())).append("</p>")
+                .append("<div class='grid-2'>")
+                .append("<div><p><strong>Session date:</strong> ").append(fmtDate(starts)).append("</p>")
+                .append("<p><strong>Topic:</strong> ").append(esc(live.getCategory())).append("</p>")
+                .append("<p><strong>Format:</strong> ").append(esc(live.getType().toString())).append("</p>")
+                .append("<p><strong>Countdown:</strong> <span id='live-countdown' data-starts-at='")
+                .append(starts == null ? "" : starts.toString()).append("' data-ends-at='")
+                .append(ends == null ? "" : ends.toString()).append("'>")
+                .append(starts == null ? "Date to be confirmed" : ended ? "Session has ended" : scheduledToday ? "Session day" : "Loading…")
+                .append("</span></p></div>")
+                .append("<div class='card' style='margin:0;background:#f8fafc'><h3>Live room</h3>")
+                .append("<p><strong>Registered:</strong> ").append(registrations)
+                .append(" &nbsp; <strong>Checked in:</strong> ").append(checkIns).append("</p>")
+                .append("<p><strong>Your status:</strong> ").append(checkedIn ? "Checked in" : enrolled ? "Registered" : "Not registered").append("</p>");
+
+        if (enrolled && scheduledToday && checkedIn && roomUrl != null) {
+            content.append("<p class='mt-2'><a class='btn primary' href='").append(esc(roomUrl))
+                    .append("' target='_blank' rel='noopener noreferrer'>Join live room</a></p>");
+        } else if (enrolled && scheduledToday && !checkedIn) {
+            content.append("<form method='post' action='/live-session/check-in' class='mt-2'>")
+                    .append("<button class='btn primary' type='submit'>Check in and join</button></form>");
+        } else if (!enrolled && !ended) {
+            content.append("<form method='post' action='/live-session' class='mt-2'>")
+                    .append("<button class='btn primary' type='submit'>Register for session</button></form>");
+        } else if (enrolled && !ended) {
+            content.append("<p class='muted'>The room link and attendance check-in will be available on the session date.</p>");
+        } else {
+            content.append("<p class='muted'>Registration and room access are closed for this session.</p>");
+        }
+        if (roomUrl == null) {
+            content.append("<p class='muted'>The facilitator has not added a valid room link yet.</p>");
+        }
+        content.append("</div></div>")
+                .append("<script>(function(){var el=document.getElementById('live-countdown');if(!el||!el.dataset.startsAt)return;")
+                .append("var start=new Date(el.dataset.startsAt+'T00:00:00');var end=new Date((el.dataset.endsAt||el.dataset.startsAt)+'T00:00:00');")
+                .append("var now=new Date();var today=new Date(now.getFullYear(),now.getMonth(),now.getDate());var days=Math.ceil((start-today)/86400000);")
+                .append("if(today>end)el.textContent='Session has ended';else if(today>=start)el.textContent='Session day';")
+                .append("else el.textContent=days+' day'+(days===1?'':'s')+' remaining';})();</script>");
+
+        sendHtml(ex, 200, page("Live Session", user, "/live-session", content.toString()));
+    }
+
+    static void liveSessionPost(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        Optional<LearningActivity> liveOpt = ACTIVITIES.findAll().stream()
+                .filter(a -> a.getType() == ActivityType.LIVE_SESSION)
+                .findFirst();
+        if (liveOpt.isEmpty()) {
+            setFlash(ex, "No live session is available right now.", true);
+            redirect(ex, "/level-one");
+            return;
+        }
+        try {
+            LearningActivity live = liveOpt.get();
+            if (live.getEndDate() != null && LocalDate.now().isAfter(live.getEndDate())) {
+                throw new ValidationException("Registration is closed for this session.");
+            }
+            LEARNING.enroll(user, live);
+            setFlash(ex, "You are registered for the live virtual exchange.");
+            redirect(ex, "/live-session");
+        } catch (Exception e) {
+            setFlash(ex, e.getMessage(), true);
+            redirect(ex, "/live-session");
+        }
+    }
+
+    static void liveSessionCheckIn(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        Optional<LearningActivity> liveOpt = ACTIVITIES.findAll().stream()
+                .filter(a -> a.getType() == ActivityType.LIVE_SESSION)
+                .findFirst();
+        if (liveOpt.isEmpty()) {
+            setFlash(ex, "No live session is available right now.", true);
+            redirect(ex, "/live-session");
+            return;
+        }
+
+        LearningActivity live = liveOpt.get();
+        LocalDate today = LocalDate.now();
+        LocalDate starts = live.getStartDate();
+        LocalDate ends = live.getEndDate() == null ? starts : live.getEndDate();
+        if (!isEnrolled(user, live)) {
+            setFlash(ex, "Register for the session before checking in.", true);
+        } else if (starts == null || ends == null || today.isBefore(starts) || today.isAfter(ends)) {
+            setFlash(ex, "Attendance check-in is only available on the scheduled session date.", true);
+        } else {
+            LIVE_ATTENDANCE.computeIfAbsent(live.getId(), id -> ConcurrentHashMap.newKeySet()).add(user.getId());
+            setFlash(ex, "Attendance recorded. You can now join the live room.");
+        }
+        redirect(ex, "/live-session");
+    }
+
+    static boolean isEnrolled(User user, LearningActivity activity) {
+        return ENROLLS.findAll().stream()
+                .anyMatch(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(activity.getId()));
+    }
+
+    static String safeHttpUrl(String value) {
+        if (value == null || value.isBlank()) return null;
+        try {
+            URI uri = URI.create(value);
+            String scheme = uri.getScheme();
+            return uri.getHost() != null && ("https".equalsIgnoreCase(scheme) || "http".equalsIgnoreCase(scheme))
+                    ? value : null;
+        } catch (IllegalArgumentException e) {
+            return null;
+        }
+    }
+
     static void certificate(HttpExchange ex, User user) throws IOException {
         if (user == null) { redirect(ex, "/login"); return; }
         List<Certificate> certs = CERTS.findAll().stream().filter(c -> c.getUserId().equals(user.getId())).collect(Collectors.toList());
@@ -724,6 +888,7 @@ public class YEPWebApp {
             sb.append("<a href='/dashboard' class='").append(activePath.equals("/dashboard") ? "active" : "").append("'>Dashboard</a>");
             sb.append("<a href='/activities' class='").append(activePath.equals("/activities") ? "active" : "").append("'>Activities</a>");
             sb.append("<a href='/level-one' class='").append(activePath.equals("/level-one") ? "active" : "").append("'>Level 1</a>");
+            sb.append("<a href='/live-session' class='").append(activePath.equals("/live-session") ? "active" : "").append("'>Live Session</a>");
             sb.append("<a href='/level-two' class='").append(activePath.equals("/level-two") ? "active" : "").append("'>Level 2</a>");
             sb.append("<a href='/discussion' class='").append(activePath.equals("/discussion") || activePath.equals("/thread") ? "active" : "").append("'>Discussions</a>");
             sb.append("<a href='/certificate' class='").append(activePath.equals("/certificate") ? "active" : "").append("'>Certificates</a>");
