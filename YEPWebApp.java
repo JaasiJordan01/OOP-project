@@ -60,11 +60,6 @@ public class YEPWebApp {
     static final Map<String, User> SESSIONS = new ConcurrentHashMap<>();
     static final Map<String, String> FLASH_MESSAGES = new ConcurrentHashMap<>();
     static final Map<Long, Set<Long>> LIVE_ATTENDANCE = new ConcurrentHashMap<>();
-    static final Map<Long, String> YOUTH_AGE_STATUS = new ConcurrentHashMap<>();
-    static final Map<Long, LocalDate> YOUTH_DATE_OF_BIRTH = new ConcurrentHashMap<>();
-    static final Map<Long, LocalDate> YOUTH_REGISTERED_ON = new ConcurrentHashMap<>();
-    static final Map<Long, Long> AGE_REVIEWED_BY = new ConcurrentHashMap<>();
-    static final Map<Long, LocalDateTime> AGE_REVIEWED_AT = new ConcurrentHashMap<>();
 
     // ==================== SERVICES ====================
     static final AuthService        AUTH     = new AuthService(USERS);
@@ -113,12 +108,6 @@ public class YEPWebApp {
                 redirect(ex, "/login");
                 return;
             }
-            if (isPendingYouth(user)
-                    && !path.equals("/enrollment") && !path.equals("/profile") && !path.equals("/logout")
-                    && !path.startsWith("/profile-photo/")) {
-                redirect(ex, "/enrollment");
-                return;
-            }
             if (path.startsWith("/profile-photo/")) {
                 profilePhotoGet(ex, user, path);
                 return;
@@ -140,16 +129,6 @@ public class YEPWebApp {
                 case "/level-one/complete" -> {
                     if (method.equals("POST")) levelOneCompletePost(ex, user);
                     else sendHtml(ex, 405, page("Method not allowed", user, "/level-one",
-                            "<div class='card'><h1>Method not allowed</h1></div>"));
-                }
-                case "/age-verification" -> {
-                    if (method.equals("GET")) ageVerificationGet(ex, user);
-                    else sendHtml(ex, 405, page("Method not allowed", user, "/age-verification",
-                            "<div class='card'><h1>Method not allowed</h1></div>"));
-                }
-                case "/age-verification/review" -> {
-                    if (method.equals("POST")) ageVerificationReviewPost(ex, user);
-                    else sendHtml(ex, 405, page("Method not allowed", user, "/age-verification",
                             "<div class='card'><h1>Method not allowed</h1></div>"));
                 }
                 case "/dashboard"   -> dashboard(ex, user);
@@ -236,7 +215,7 @@ public class YEPWebApp {
               </select></label>
               <div id="youthFields" class="auth-fields">
                 <label class="fld"><span aria-hidden="true">🎂</span><input type="date" id="dob" name="dob" min="%s" max="%s" required aria-label="Date of birth"></label>
-                <p class="hint">Enter your real date of birth. YEP calculates your age on the server. Youth accounts stay pending until an administrator checks proof of age.</p>
+                <p class="hint">Enter your real date of birth. YEP calculates your age on the server and activates eligible accounts immediately. This is self-reported and does not verify identity.</p>
                 <div class="auth-grid">
                   <label class="fld"><span aria-hidden="true">⚧</span><select name="gender" aria-label="Gender"><option value="">Gender (optional)</option><option>Female</option><option>Male</option><option>Other</option></select></label>
                   <label class="fld"><span aria-hidden="true">🌍</span><select name="country" aria-label="Country"><option value="">Country</option>%s</select></label>
@@ -294,14 +273,10 @@ public class YEPWebApp {
                 f.get("expertise"), f.get("organisation")
             );
             if (u instanceof YouthParticipant) {
-                u.suspend();
-                YOUTH_AGE_STATUS.put(u.getId(), "PENDING");
-                YOUTH_DATE_OF_BIRTH.put(u.getId(), dob);
-                YOUTH_REGISTERED_ON.put(u.getId(), LocalDate.now());
                 String sid = UUID.randomUUID().toString();
                 SESSIONS.put(sid, u);
                 setSessionCookie(ex, sid);
-                setFlash(ex, "Registration received. Complete the enrollment form while your age verification is pending.");
+                setFlash(ex, "Your age is within the programme range. Complete your Level One enrollment.");
                 redirect(ex, "/enrollment");
                 return;
             }
@@ -337,18 +312,6 @@ public class YEPWebApp {
         Map<String, String> f = parseForm(ex);
         try {
             User u = AUTH.login(f.get("email"), f.get("password"));
-            if (u instanceof YouthParticipant && "PENDING".equals(YOUTH_AGE_STATUS.get(u.getId()))) {
-                String sid = UUID.randomUUID().toString();
-                SESSIONS.put(sid, u);
-                setSessionCookie(ex, sid);
-                setFlash(ex, "Age verification is pending. You can complete enrollment while you wait.");
-                redirect(ex, "/enrollment");
-                return;
-            }
-            if (u instanceof YouthParticipant && !"VERIFIED".equals(YOUTH_AGE_STATUS.get(u.getId()))) {
-                loginGet(ex, "Your account is awaiting manual age verification.");
-                return;
-            }
             String sid = UUID.randomUUID().toString();
             SESSIONS.put(sid, u);
             setSessionCookie(ex, sid);
@@ -357,96 +320,6 @@ public class YEPWebApp {
         } catch (Exception e) {
             loginGet(ex, e.getMessage());
         }
-    }
-
-    static void ageVerificationGet(HttpExchange ex, User user) throws IOException {
-        if (user == null) { redirect(ex, "/login"); return; }
-        if (user.getRole() != UserRole.ADMIN) {
-            sendHtml(ex, 403, page("Forbidden", user, "/age-verification",
-                    "<div class='card'><h1>Administrator access required</h1></div>"));
-            return;
-        }
-
-        List<User> pending = USERS.findAll().stream()
-                .filter(u -> u instanceof YouthParticipant)
-                .filter(u -> "PENDING".equals(YOUTH_AGE_STATUS.get(u.getId())))
-                .collect(Collectors.toList());
-        StringBuilder rows = new StringBuilder();
-        if (pending.isEmpty()) {
-            rows.append("<div class='empty-state'><p>No youth registrations are awaiting age review.</p></div>");
-        } else {
-            for (User applicant : pending) {
-                YouthParticipant youth = (YouthParticipant) applicant;
-                LocalDate dob = YOUTH_DATE_OF_BIRTH.get(youth.getId());
-                rows.append("<div class='card'><div class='flex-between'><div><h2>")
-                        .append(esc(youth.getName())).append("</h2><p class='muted'>").append(esc(youth.getEmail()))
-                        .append("</p></div><span class='badge warning'>Pending review</span></div>")
-                        .append("<p><strong>Date of birth:</strong> ").append(fmtDate(dob))
-                        .append(" &nbsp; <strong>Calculated age:</strong> ").append(youth.getAge()).append("</p>")
-                        .append("<p class='muted'>Compare the birth date with official proof of age presented to the YEP team. Do not copy or upload the document.</p>")
-                        .append("<form method='post' action='/age-verification/review' class='flex-row'>")
-                        .append("<input type='hidden' name='userId' value='").append(youth.getId()).append("'>")
-                        .append("<button class='btn primary' type='submit' name='decision' value='approve'>Proof checked — approve</button>")
-                        .append("<button class='btn' type='submit' name='decision' value='reject' style='color:#dc2626'>Reject registration</button>")
-                        .append("</form></div>");
-            }
-        }
-        String content = "<div class='page-header'><h1>Youth age verification</h1>"
-                + "<p class='muted'>Review proof of age before allowing a youth participant to sign in.</p></div>"
-                + "<div class='alert' style='background:#dbe7ff;border:1px solid #c5d6ff'>"
-                + "Only view an official document with the applicant. Do not request or retain document numbers, scans, or photos.</div>"
-                + rows;
-        sendHtml(ex, 200, page("Age Verification", user, "/age-verification", content));
-    }
-
-    static void ageVerificationReviewPost(HttpExchange ex, User user) throws IOException {
-        if (user == null) { redirect(ex, "/login"); return; }
-        if (user.getRole() != UserRole.ADMIN) {
-            sendHtml(ex, 403, page("Forbidden", user, "/age-verification",
-                    "<div class='card'><h1>Administrator access required</h1></div>"));
-            return;
-        }
-        Map<String, String> form = parseForm(ex);
-        try {
-            long userId = Long.parseLong(form.getOrDefault("userId", ""));
-            User applicant = USERS.findById(userId)
-                    .filter(u -> u instanceof YouthParticipant)
-                    .filter(u -> "PENDING".equals(YOUTH_AGE_STATUS.get(u.getId())))
-                    .orElseThrow(() -> new ValidationException("Pending registration not found."));
-            String decision = form.get("decision");
-            if ("approve".equals(decision)) {
-                LocalDate dob = YOUTH_DATE_OF_BIRTH.get(userId);
-                LocalDate registeredOn = YOUTH_REGISTERED_ON.get(userId);
-                if (dob == null || registeredOn == null) {
-                    throw new ValidationException("Age verification details are unavailable; registration cannot be approved.");
-                }
-                int age = ageOn(dob, registeredOn);
-                ((YouthParticipant) applicant).setAge(age);
-                applicant.activate();
-                YOUTH_AGE_STATUS.put(userId, "VERIFIED");
-                YOUTH_DATE_OF_BIRTH.remove(userId);
-                YOUTH_REGISTERED_ON.remove(userId);
-                AGE_REVIEWED_BY.put(userId, user.getId());
-                AGE_REVIEWED_AT.put(userId, LocalDateTime.now());
-                setFlash(ex, "Age verified. " + applicant.getName() + " can now sign in.");
-            } else if ("reject".equals(decision)) {
-                deleteProfilePhoto(applicant.getProfile().getPhotoUrl());
-                ENROLLS.findAll().stream().filter(e -> e.getUserId().equals(userId))
-                        .map(Enrollment::getId).toList().forEach(ENROLLS::delete);
-                USERS.delete(userId);
-                YOUTH_AGE_STATUS.remove(userId);
-                YOUTH_DATE_OF_BIRTH.remove(userId);
-                YOUTH_REGISTERED_ON.remove(userId);
-                AGE_REVIEWED_BY.remove(userId);
-                AGE_REVIEWED_AT.remove(userId);
-                setFlash(ex, "Registration rejected and pending account data deleted.");
-            } else {
-                throw new ValidationException("Choose approve or reject.");
-            }
-        } catch (Exception e) {
-            setFlash(ex, e.getMessage(), true);
-        }
-        redirect(ex, "/age-verification");
     }
 
     static void enrollmentGet(HttpExchange ex, User user) throws IOException {
@@ -467,9 +340,8 @@ public class YEPWebApp {
                     .append(enrolled ? " <span class='badge success'>Enrolled</span>" : "")
                     .append("</span></label>");
         }
-        String ageStatus = "PENDING".equals(YOUTH_AGE_STATUS.get(user.getId()))
-                ? "<div class='alert' style='background:#fef3c7;border:1px solid #fde68a;color:#92400e'>Your age review is pending. You can complete enrollment now, but learning access remains locked until an administrator verifies your age.</div>"
-                : "<div class='alert success'>Your youth account is verified. Choose the Level One activities you want to enroll in.</div>";
+        String ageStatus = "<div class='alert success'>Your age was calculated from the date of birth provided at signup. Choose the Level One activities you want to enroll in.</div>"
+                + "<p class='muted'>Age eligibility is self-reported and is not identity-verified.</p>";
         String content = "<div class='page-header'><h1>Level One Enrollment</h1><p class='muted'>Welcome to YEP. Start by choosing the Level One learning and Virtual Exchange activities you want to join.</p></div>"
                 + ageStatus
                 + "<form method='post' action='/enrollment' class='card'><h2>Choose Level One activities</h2>"
@@ -961,8 +833,7 @@ public class YEPWebApp {
 
     static void levelOneCompletePost(HttpExchange ex, User user) throws IOException {
         if (user == null) { redirect(ex, "/login"); return; }
-        if (!(user instanceof YouthParticipant) || !user.isActive()
-                || !"VERIFIED".equals(YOUTH_AGE_STATUS.get(user.getId()))) {
+        if (!(user instanceof YouthParticipant) || !user.isActive()) {
             sendHtml(ex, 403, page("Level One", user, "/level-one",
                     "<div class='card'><h1>Verified youth account required</h1></div>"));
             return;
@@ -1011,7 +882,6 @@ public class YEPWebApp {
         if (user == null || isLimitedStakeholder(user)) return false;
         if (!(user instanceof YouthParticipant youth)) return true;
         return user.isActive()
-                && "VERIFIED".equals(YOUTH_AGE_STATUS.get(user.getId()))
                 && youth.isEligibleForLevelTwo()
                 && hasCompletedLevelOne(user);
     }
@@ -1579,21 +1449,14 @@ public class YEPWebApp {
             sb.append("<a href='/login' class='").append(activePath.equals("/login") ? "active" : "").append("'>Sign in</a>");
             sb.append("<a href='/register' class='btn primary small' style='margin-left:8px'>Join YEP</a>");
         } else {
-            if (isPendingYouth(user)) {
-                sb.append("<a href='/enrollment' class='").append(activePath.equals("/enrollment") ? "active" : "").append("'>Enrollment</a>");
-            } else {
+            if (!isLimitedStakeholder(user)) {
                 sb.append("<a href='/dashboard' class='").append(activePath.equals("/dashboard") ? "active" : "").append("'>Dashboard</a>");
                 sb.append("<a href='/activities' class='").append(activePath.equals("/activities") ? "active" : "").append("'>Activities</a>");
-            }
-            if (!isLimitedStakeholder(user) && !isPendingYouth(user)) {
                 sb.append("<a href='/level-one' class='").append(activePath.equals("/level-one") ? "active" : "").append("'>Level 1</a>");
                 sb.append("<a href='/live-session' class='").append(activePath.equals("/live-session") ? "active" : "").append("'>Live Session</a>");
                 sb.append("<a href='/level-two' class='").append(activePath.equals("/level-two") ? "active" : "").append("'>Level 2</a>");
                 sb.append("<a href='/discussion' class='").append(activePath.equals("/discussion") || activePath.equals("/thread") ? "active" : "").append("'>Discussions</a>");
                 sb.append("<a href='/certificate' class='").append(activePath.equals("/certificate") ? "active" : "").append("'>Certificates</a>");
-                if (user.getRole() == UserRole.ADMIN) {
-                    sb.append("<a href='/age-verification' class='").append(activePath.equals("/age-verification") ? "active" : "").append("'>Age verification</a>");
-                }
             }
             sb.append("<span style='border-left:1px solid var(--border);margin:0 8px'></span>");
             sb.append("<a href='/profile' class='nav-profile ").append(activePath.equals("/profile") ? "active" : "").append("'>")
@@ -1609,11 +1472,6 @@ public class YEPWebApp {
             case UNIVERSITY, EMPLOYER, PARTNER, RESEARCHER -> true;
             default -> false;
         };
-    }
-
-    static boolean isPendingYouth(User user) {
-        return user instanceof YouthParticipant
-                && "PENDING".equals(YOUTH_AGE_STATUS.get(user.getId()));
     }
 
     static String profileAvatarHtml(User user) {
@@ -1804,9 +1662,6 @@ public class YEPWebApp {
             YouthParticipant alice = (YouthParticipant) AUTH.register("YOUTH", "Alice Nakato", "alice@yep.ug", "+256770000001", "password", 22, "Female", "Uganda", "Kampala", "BSc Computer Science", null, null);
             YouthParticipant bob = (YouthParticipant) AUTH.register("YOUTH", "Bob Okello", "bob@yep.ug", "+256770000002", "password", 26, "Male", "Uganda", "Gulu", "Diploma in Agriculture", null, null);
             YouthParticipant charlie = (YouthParticipant) AUTH.register("YOUTH", "Charlie Mwangi", "charlie@yep.ke", "+254780000003", "password", 24, "Male", "Kenya", "Nairobi", "BA Communications", null, null);
-            for (YouthParticipant participant : List.of(alice, bob, charlie)) {
-                YOUTH_AGE_STATUS.put(participant.getId(), "VERIFIED");
-            }
             Facilitator david = (Facilitator) AUTH.register("FACILITATOR", "David Ssem", "david@yep.ug", "+256770000005", "password", null, null, null, null, null, "Digital Literacy", null);
             Mentor grace = (Mentor) AUTH.register("MENTOR", "Grace Achieng", "grace@yep.ug", "+256770000004", "password", null, null, null, null, null, "AgriTech", "Makerere University");
             AUTH.register("ADMIN", "YEP Admin", "admin@yep.ug", "+256770000006", "password", null, null, null, null, null, null, null);
