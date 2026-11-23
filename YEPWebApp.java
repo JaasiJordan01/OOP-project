@@ -55,6 +55,7 @@ public class YEPWebApp {
     static final Repository<DiscussionPost>   POSTS      = new InMemoryRepository<>();
     static final Repository<Team>             TEAMS      = new InMemoryRepository<>();
     static final Repository<ImpactProject>    PROJECTS   = new InMemoryRepository<>();
+    static final Repository<Submission>       SUBMISSIONS = new InMemoryRepository<>();
     static final Repository<Certificate>      CERTS      = new InMemoryRepository<>();
 
     static final Map<String, User> SESSIONS = new ConcurrentHashMap<>();
@@ -66,7 +67,7 @@ public class YEPWebApp {
     static final LearningService    LEARNING = new LearningService(ACTIVITIES, ENROLLS);
     static final DiscussionService  DISCUSS  = new DiscussionService(THREADS, POSTS);
     static final TeamService        TEAM_SVC = new TeamService(TEAMS, USERS);
-    static final ProjectService     PROJ_SVC = new ProjectService(PROJECTS);
+    static final ProjectService     PROJ_SVC = new ProjectService(PROJECTS, SUBMISSIONS);
     static final AssessmentService  ASSESS   = new AssessmentService(CERTS);
     static final NotificationService NOTIFY  = new NotificationService();
 
@@ -938,6 +939,33 @@ public class YEPWebApp {
             if (t.getMentorId() != null) {
                 USERS.findById(t.getMentorId()).ifPresent(m -> sb.append("<p class='mt-2'>Mentor: <strong>").append(esc(m.getName())).append("</strong></p>"));
             }
+            PROJECTS.findAll().stream()
+                    .filter(p -> p.getTeamId().equals(t.getId()))
+                    .findFirst()
+                    .ifPresent(project -> {
+                        sb.append("<div class='card mt-4'><h2>Impact Project</h2>")
+                          .append("<h3>").append(esc(project.getTitle())).append("</h3>")
+                          .append("<p class='muted'>").append(esc(project.getDescription())).append("</p>")
+                          .append("<p><strong>Challenge:</strong> ").append(esc(project.getChallengeArea().getLabel()))
+                          .append(" &nbsp; <strong>Status:</strong> ").append(esc(project.getStatus().name())).append("</p>");
+                        if (!project.getMilestones().isEmpty()) {
+                            sb.append("<h4 class='mt-4'>Milestones</h4><ul class='list'>");
+                            for (Milestone milestone : project.getMilestones()) {
+                                sb.append("<li>").append(esc(milestone.getTitle()))
+                                  .append(" <span class='muted'>- due ").append(fmtDate(milestone.getDueDate())).append("</span></li>");
+                            }
+                            sb.append("</ul>");
+                        }
+                        SUBMISSIONS.findAll().stream()
+                                .filter(s -> s.getProjectId().equals(project.getId()))
+                                .findFirst()
+                                .ifPresent(submission -> sb
+                                        .append("<div class='mt-4'><h4>Submission notes</h4>")
+                                        .append("<p>").append(esc(submission.getNotes())).append("</p>")
+                                        .append("</div>")
+                                );
+                        sb.append("</div>");
+                    });
             sb.append("</div>");
         }
 
@@ -1690,6 +1718,14 @@ public class YEPWebApp {
             ImpactProject proj = PROJ_SVC.create(agri, "Smart Agri Advisor", ChallengeArea.AGRICULTURE, "Mobile-first crop advisory service for smallholder farmers", LocalDate.now(), LocalDate.now().plusMonths(3));
             PROJ_SVC.addMilestone(proj, "Problem statement", LocalDate.now().plusDays(7));
             PROJ_SVC.addMilestone(proj, "MVP mockup", LocalDate.now().plusDays(30));
+            Submission sampleSubmission = PROJ_SVC.submit(
+                    proj,
+                    "Smart Agri Advisor - MVP proposal",
+                    "https://content.yep.ug/projects/smart-agri-advisor-mvp",
+                    "The MVP combines farmer field reports, local weather forecasts and an offline SMS advisory flow. "
+                    + "It prioritizes crop identification, practical recommendations and simple Ugandan-language prompts. "
+                    + "Next steps: pilot with 20 farmers, collect usability feedback and validate recommendations with an agronomist.");
+            sampleSubmission.grade(88, "Strong user need and clear implementation plan. Improve the offline SMS fallback and include evidence from the farmer pilot.");
 
             // Discussions
             DiscussionThread t1 = DISCUSS.createThread(alice, ai101.getId(), "AI Ethics", "How do we spot deepfakes?", "I saw a video claiming to be a minister, but the lips did not match the audio. How can we verify?");
@@ -1948,7 +1984,7 @@ class Submission extends BaseEntity {
     public Submission(Long p, String t, String url, String notes) { this.projectId = p; this.title = t; this.fileUrl = url; this.notes = notes; }
     public void grade(double s, String f) { this.score = s; this.feedback = f; }
     @Override public String displayLabel() { return "Submission: " + title; }
-    public Long getProjectId() { return projectId; } public String getTitle() { return title; } public String getFileUrl() { return fileUrl; } public Double getScore() { return score; } public String getFeedback() { return feedback; }
+    public Long getProjectId() { return projectId; } public String getTitle() { return title; } public String getFileUrl() { return fileUrl; } public String getNotes() { return notes; } public Double getScore() { return score; } public String getFeedback() { return feedback; }
 }
 
 class DiscussionPost extends BaseEntity {
@@ -2083,10 +2119,11 @@ class TeamService {
 }
 class ProjectService {
     private final Repository<ImpactProject> projects;
-    ProjectService(Repository<ImpactProject> p) { this.projects = p; }
+    private final Repository<Submission> submissions;
+    ProjectService(Repository<ImpactProject> p, Repository<Submission> s) { this.projects = p; this.submissions = s; }
     ImpactProject create(Team team, String title, ChallengeArea area, String desc, LocalDate start, LocalDate end) { ImpactProject p = new ImpactProject(team.getId(), title, area, desc); p.start(start, end); return projects.save(p); }
     Milestone addMilestone(ImpactProject project, String title, LocalDate due) { Milestone m = new Milestone(project.getId(), title, due); project.addMilestone(m); return m; }
-    Submission submit(ImpactProject project, String title, String fileUrl, String notes) { Submission s = new Submission(project.getId(), title, fileUrl, notes); project.setStatus(ProjectStatus.SUBMITTED); return s; }
+    Submission submit(ImpactProject project, String title, String fileUrl, String notes) { Submission s = new Submission(project.getId(), title, fileUrl, notes); project.setStatus(ProjectStatus.SUBMITTED); return submissions.save(s); }
 }
 class AssessmentService {
     private final Repository<Certificate> certificates;
