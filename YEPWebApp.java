@@ -127,6 +127,11 @@ public class YEPWebApp {
                 case "/logout"      -> logout(ex);
                 case "/profile"    -> { if (method.equals("POST")) profilePost(ex, user); else profileGet(ex, user, null); }
                 case "/enrollment" -> { if (method.equals("POST")) enrollmentPost(ex, user); else enrollmentGet(ex, user); }
+                case "/activity" -> {
+                    if (method.equals("GET")) activityGet(ex, user);
+                    else sendHtml(ex, 405, page("Method not allowed", user, "/activities",
+                            "<div class='card'><h1>Method not allowed</h1></div>"));
+                }
                 case "/level-one/complete" -> {
                     if (method.equals("POST")) levelOneCompletePost(ex, user);
                     else sendHtml(ex, 405, page("Method not allowed", user, "/level-one",
@@ -317,7 +322,8 @@ public class YEPWebApp {
             SESSIONS.put(sid, u);
             setSessionCookie(ex, sid);
             setFlash(ex, "Logged in successfully.");
-            redirect(ex, "/dashboard");
+            redirect(ex, u instanceof YouthParticipant && LEARNING.forUser(u.getId()).isEmpty()
+                    ? "/enrollment" : "/dashboard");
         } catch (Exception e) {
             loginGet(ex, e.getMessage());
         }
@@ -611,7 +617,10 @@ public class YEPWebApp {
         } else {
             actHtml.append("<ul class='list'>");
             for (LearningActivity a : myActs) {
-                actHtml.append("<li><div><strong>").append(esc(a.getTitle())).append("</strong><br><span class='badge'>Level ").append(a.getLevel().getValue()).append("</span> <span class='muted'>").append(esc(a.getCategory())).append("</span></div></li>");
+                actHtml.append("<li><div><strong><a href='/activity?id=").append(a.getId()).append("'>")
+                        .append(esc(a.getTitle())).append("</a></strong><br><span class='badge'>Level ")
+                        .append(a.getLevel().getValue()).append("</span> <span class='muted'>")
+                        .append(esc(a.getCategory())).append("</span></div></li>");
             }
             actHtml.append("</ul>");
         }
@@ -695,9 +704,14 @@ public class YEPWebApp {
             list.append("<div class='empty-state'><h3>No activities found</h3><p>Try clearing your filters.</p><a class='btn' href='/activities'>Clear Filters</a></div>");
         } else {
             for (LearningActivity a : filtered) {
+                boolean enrolled = hasEnrollment(user, a);
                 list.append("<div class='card flex-between'>")
                     .append("<div style='flex:1'>")
-                    .append("<h2>").append(esc(a.getTitle())).append(" <span class='badge'>Level ").append(a.getLevel().getValue()).append("</span></h2>")
+                    .append("<h2>");
+                if (enrolled) list.append("<a href='/activity?id=").append(a.getId()).append("'>");
+                list.append(esc(a.getTitle()));
+                if (enrolled) list.append("</a>");
+                list.append(" <span class='badge'>Level ").append(a.getLevel().getValue()).append("</span></h2>")
                     .append("<p class='muted mb-2'>").append(esc(a.getDescription())).append("</p>")
                     .append("<p class='muted' style='font-size:0.8rem'>").append(a.getType()).append(" · ").append(esc(a.getCategory())).append(" · ").append(fmtDate(a.getStartDate())).append("</p>")
                     .append("</div>")
@@ -706,12 +720,13 @@ public class YEPWebApp {
                     if (!(user instanceof YouthParticipant)) {
                         list.append("<span class='badge'>Youth participants</span>");
                     } else {
-                        boolean enrolled = hasEnrollment(user, a);
                         if (enrolled) list.append("<span class='badge success'>Enrolled ✓</span>");
                         else list.append("<form method='post' action='/enroll'><input type='hidden' name='activityId' value='").append(a.getId()).append("'><button class='btn primary' type='submit'>Enroll</button></form>");
                     }
                 } else {
-                    list.append("<a class='btn' href='/level-two'>Go to Level 2</a>");
+                    list.append(enrolled
+                            ? "<a class='btn' href='/activity?id=" + a.getId() + "'>Open exchange</a>"
+                            : "<a class='btn' href='/level-two'>Go to Level 2</a>");
                 }
                 list.append("</div></div>");
             }
@@ -733,6 +748,71 @@ public class YEPWebApp {
             "</div>" + list;
 
         sendHtml(ex, 200, page("Activities", user, "/activities", content));
+    }
+
+    static void activityGet(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        String id = parseQuery(ex.getRequestURI().getQuery()).get("id");
+        long activityId;
+        try {
+            activityId = Long.parseLong(id);
+        } catch (NumberFormatException | NullPointerException e) {
+            sendHtml(ex, 404, page("Activity not found", user, "/activities",
+                    "<div class='card'><h1>Activity not found</h1><a class='btn' href='/activities'>Browse activities</a></div>"));
+            return;
+        }
+        Optional<LearningActivity> activityOpt = ACTIVITIES.findById(activityId)
+                .filter(LearningActivity::isPublished);
+        if (activityOpt.isEmpty()) {
+            sendHtml(ex, 404, page("Activity not found", user, "/activities",
+                    "<div class='card'><h1>Activity not found</h1><a class='btn' href='/activities'>Browse activities</a></div>"));
+            return;
+        }
+        LearningActivity activity = activityOpt.get();
+        if (activity.getLevel() == ActivityLevel.LEVEL_TWO && !canAccessLevelTwo(user)) {
+            sendHtml(ex, 403, page("Level Two locked", user, "/level-two",
+                    "<div class='card'><h1>Level Two is locked</h1><p class='muted'>Complete all Level One activities before accessing this exchange.</p><a class='btn primary' href='/level-one'>Continue Level One</a></div>"));
+            return;
+        }
+        Optional<Enrollment> enrollment = ENROLLS.findAll().stream()
+                .filter(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(activityId))
+                .findFirst();
+        if (enrollment.isEmpty()) {
+            sendHtml(ex, 403, page("Enrollment required", user, "/activities",
+                    "<div class='card'><h1>Enrollment required</h1><p class='muted'>Enroll in this activity before opening its course materials.</p><a class='btn primary' href='/activities'>Browse activities</a></div>"));
+            return;
+        }
+
+        StringBuilder content = new StringBuilder("<a class='btn mb-4' href='/activities'>Browse activities</a>")
+                .append("<div class='page-header'><h1>").append(esc(activity.getTitle()))
+                .append(" <span class='badge'>Level ").append(activity.getLevel().getValue()).append("</span></h1>")
+                .append("<p class='muted'>").append(activity.getType()).append(" · ")
+                .append(esc(activity.getCategory())).append(" · ").append(fmtDate(activity.getStartDate()));
+        if (activity.getEndDate() != null && !activity.getEndDate().equals(activity.getStartDate())) {
+            content.append(" – ").append(fmtDate(activity.getEndDate()));
+        }
+        content.append("</p></div><div class='card'><p>").append(esc(activity.getDescription())).append("</p>");
+        if (enrollment.get().getStatus() == EnrollmentStatus.COMPLETED) {
+            content.append("<span class='badge success'>Completed ✓</span>");
+        } else {
+            content.append("<span class='badge'>In progress</span>");
+        }
+        String materialsUrl = safeHttpUrl(activity.getContentUrl());
+        if (materialsUrl != null) {
+            content.append("<p class='mt-4'><a class='btn primary' href='").append(esc(materialsUrl))
+                    .append("' target='_blank' rel='noopener noreferrer'>Open course materials</a></p>");
+        } else {
+            content.append("<p class='muted mt-4'>Course materials are not available for this activity yet.</p>");
+        }
+        if (activity.getLevel() == ActivityLevel.LEVEL_ONE
+                && enrollment.get().getStatus() != EnrollmentStatus.COMPLETED) {
+            content.append("<form method='post' action='/level-one/complete' class='mt-4'>")
+                    .append("<input type='hidden' name='activityId' value='").append(activityId).append("'>")
+                    .append("<input type='hidden' name='returnToActivity' value='true'>")
+                    .append("<button class='btn' type='submit'>Mark activity complete</button></form>");
+        }
+        content.append("</div>");
+        sendHtml(ex, 200, page(activity.getTitle(), user, "/activities", content.toString()));
     }
 
     static void enroll(HttpExchange ex, User user) throws IOException {
@@ -781,16 +861,23 @@ public class YEPWebApp {
         if (list.isEmpty()) sb.append("<p class='muted'>No Level One sessions yet.</p>");
         else {
             for (LearningActivity a : list) {
+                Optional<Enrollment> enrollment = user instanceof YouthParticipant
+                        ? ENROLLS.findAll().stream()
+                                .filter(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(a.getId()))
+                                .findFirst()
+                        : Optional.empty();
                 sb.append("<div class='list-item'>")
-                  .append("<div><strong>").append(esc(a.getTitle())).append("</strong><br><span class='muted'>").append(a.getType()).append(" · ").append(esc(a.getCategory())).append("</span></div>");
+                  .append("<div><strong>");
+                if (enrollment.isPresent()) sb.append("<a href='/activity?id=").append(a.getId()).append("'>");
+                sb.append(esc(a.getTitle()));
+                if (enrollment.isPresent()) sb.append("</a>");
+                sb.append("</strong><br><span class='muted'>").append(a.getType()).append(" · ").append(esc(a.getCategory())).append("</span></div>");
                 if (!(user instanceof YouthParticipant)) {
                     sb.append("<span class='badge'>Youth participants</span>");
+                } else if (enrollment.isEmpty()) {
+                    sb.append("<form method='post' action='/enroll'><input type='hidden' name='activityId' value='").append(a.getId()).append("'><button class='btn primary small'>Join</button></form>");
                 } else {
-                    Optional<Enrollment> enrollment = ENROLLS.findAll().stream()
-                            .filter(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(a.getId())).findFirst();
-                    if (enrollment.isEmpty()) {
-                        sb.append("<form method='post' action='/enroll'><input type='hidden' name='activityId' value='").append(a.getId()).append("'><button class='btn primary small'>Join</button></form>");
-                    } else if (enrollment.get().getStatus() == EnrollmentStatus.COMPLETED) {
+                    if (enrollment.get().getStatus() == EnrollmentStatus.COMPLETED) {
                         sb.append("<span class='badge success'>Completed ✓</span>");
                     } else {
                         sb.append("<form method='post' action='/level-one/complete'><input type='hidden' name='activityId' value='")
@@ -840,6 +927,7 @@ public class YEPWebApp {
             return;
         }
         Map<String, String> form = parseForm(ex);
+        String returnPath = "/level-one";
         try {
             long activityId = Long.parseLong(form.getOrDefault("activityId", ""));
             LearningActivity activity = ACTIVITIES.findById(activityId)
@@ -848,6 +936,7 @@ public class YEPWebApp {
             Enrollment enrollment = ENROLLS.findAll().stream()
                     .filter(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(activityId))
                     .findFirst().orElseThrow(() -> new ValidationException("Enroll in this activity before marking it complete."));
+            if ("true".equals(form.get("returnToActivity"))) returnPath = "/activity?id=" + activityId;
             enrollment.updateProgress(100);
             if (hasCompletedLevelOne(user)) ((YouthParticipant) user).setLevelTwoEligible(true);
             setFlash(ex, hasCompletedLevelOne(user)
@@ -856,7 +945,7 @@ public class YEPWebApp {
         } catch (Exception e) {
             setFlash(ex, "Could not complete activity: " + e.getMessage(), true);
         }
-        redirect(ex, "/level-one");
+        redirect(ex, returnPath);
     }
 
     static List<LearningActivity> requiredLevelOneActivities() {
@@ -909,8 +998,13 @@ public class YEPWebApp {
         if (list.isEmpty()) sb.append("<p class='muted'>No Level Two exchanges yet.</p>");
         else {
             for (LearningActivity a : list) {
+                boolean enrolled = hasEnrollment(user, a);
                 sb.append("<div class='list-item'>")
-                  .append("<div><strong>").append(esc(a.getTitle())).append("</strong><br><span class='muted'>").append(esc(a.getCategory())).append(" · ").append(fmtDate(a.getStartDate())).append(" → ").append(fmtDate(a.getEndDate())).append("</span></div>")
+                  .append("<div><strong>");
+                if (enrolled) sb.append("<a href='/activity?id=").append(a.getId()).append("'>");
+                sb.append(esc(a.getTitle()));
+                if (enrolled) sb.append("</a>");
+                sb.append("</strong><br><span class='muted'>").append(esc(a.getCategory())).append(" · ").append(fmtDate(a.getStartDate())).append(" → ").append(fmtDate(a.getEndDate())).append("</span></div>")
                   .append("</div>");
             }
         }
@@ -1059,7 +1153,7 @@ public class YEPWebApp {
 
         StringBuilder replies = new StringBuilder();
         if (t.getPosts().isEmpty()) replies.append("<p class='muted mb-4'>No replies yet. Be the first!</p>");
-        else for (DiscussionPost p : t.getPosts()) replies.append("<div class='card' style='background:#f8fafc'><p class='mb-1'><strong>").append(esc(p.getAuthorName())).append("</strong></p><p>").append(esc(p.getBody())).append("</p></div>");
+        else for (DiscussionPost p : t.getPosts()) replies.append("<div class='card' style='background:#15213d'><p class='mb-1'><strong>").append(esc(p.getAuthorName())).append("</strong></p><p>").append(esc(p.getBody())).append("</p></div>");
 
         String content =
             "<a href='/discussion' class='btn small mb-4'>← Back to discussions</a>" +
@@ -1132,7 +1226,7 @@ public class YEPWebApp {
                 .append(ends == null ? "" : ends.toString()).append("'>")
                 .append(starts == null ? "Date to be confirmed" : ended ? "Session has ended" : scheduledToday ? "Session day" : "Loading…")
                 .append("</span></p></div>")
-                .append("<div class='card' style='margin:0;background:#f8fafc'><h3>Live room</h3>")
+                .append("<div class='card' style='margin:0;background:#15213d'><h3>Live room</h3>")
                 .append("<p><strong>Registered:</strong> ").append(registrations)
                 .append(" &nbsp; <strong>Checked in:</strong> ").append(checkIns).append("</p>")
                 .append("<p><strong>Your status:</strong> ").append(checkedIn ? "Checked in" : enrolled ? "Registered" : "Not registered").append("</p>");
@@ -1240,7 +1334,7 @@ public class YEPWebApp {
             html.append("<div class='empty-state'><p>You haven't earned any certificates yet.</p><p class='muted'>Complete a Level 1 quiz or a Level 2 project to earn one.</p></div>");
         } else {
             for (Certificate c : certs) {
-                html.append("<div class='card' style='border-left:6px solid #fbbf24;background:linear-gradient(to right, #ffffff, #fffdf5)'>")
+                html.append("<div class='card' style='border-left:6px solid #fbbf24;background:linear-gradient(to right, #15213d, #182642)'>")
                     .append("<h2 class='mb-1'>").append(esc(c.getTitle())).append("</h2>")
                     .append("<p class='mb-1'>Awarded to <strong>").append(esc(c.getParticipantName())).append("</strong></p>")
                     .append("<p class='muted' style='font-family:monospace;font-size:0.9rem'>Certificate ID: ").append(c.getCertificateNumber()).append("</p>")
@@ -1329,16 +1423,11 @@ public class YEPWebApp {
 
     static final String CSS = """
         :root {
-            --primary: #1d4ed8; --primary-dark: #0a1f5c; --primary-light: #dbe7ff;
-            --bg: #eef2fb; --card: #ffffff; --text: #0f1b3d; --text-muted: #64708f;
-            --border: #e3e8f4; --danger: #dc2626; --warning: #fbbf24;
-            --radius: 16px; --shadow: 0 2px 10px rgba(10,31,92,.05);
-        }
-        @media (prefers-color-scheme: dark) {
-            :root {
-                --bg: #0b1226; --card: #131c36; --text: #e8ecf8; --text-muted: #9aa6c6;
-                --border: #233055; --primary-light: #1a2547; --shadow: 0 2px 10px rgba(0,0,0,.2);
-            }
+            color-scheme: dark;
+            --primary: #2856d9; --primary-dark: #101d3c; --primary-light: #17314f;
+            --bg: #0d162d; --card: #15213d; --text: #edf2ff; --text-muted: #a8b5d4;
+            --border: #26385e; --danger: #f87171; --warning: #fbbf24;
+            --radius: 16px; --shadow: 0 10px 24px rgba(2,8,23,.18);
         }
         * { box-sizing: border-box; }
         body { margin: 0; font-family: "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; background: var(--bg); color: var(--text); line-height: 1.5; }
@@ -1349,6 +1438,31 @@ public class YEPWebApp {
         p { margin: 0 0 16px 0; }
 
         /* Layout */
+        .app-shell { min-height: 100vh; display: grid; grid-template-columns: 206px minmax(0, 1fr); }
+        .sidebar { position: sticky; top: 0; height: 100vh; display: flex; flex-direction: column; padding: 16px 8px; background: linear-gradient(180deg, #10204a, #0b1530); border-right: 1px solid var(--border); z-index: 3; }
+        .sidebar-brand { display: flex; align-items: center; gap: 10px; min-height: 48px; margin: 0 4px 26px; padding: 0 4px; color: #fff; font-weight: 700; }
+        .sidebar-mark { width: 38px; height: 38px; flex: none; display: grid; place-items: center; border-radius: 12px; background: var(--warning); color: #10204a; font-size: .9rem; }
+        .sidebar-brand small { display: block; color: #a8b5d4; font-size: .68rem; font-weight: 400; }
+        .sidebar-label { margin: 0 10px 8px; color: #8495bc; font-size: .65rem; font-weight: 800; letter-spacing: .16em; text-transform: uppercase; }
+        .sidebar-links { display: flex; flex-direction: column; gap: 6px; }
+        .sidebar-links a, .sidebar-account a { min-height: 42px; display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 10px; color: #c9d4f5; font-size: .88rem; font-weight: 500; transition: background .2s, color .2s; }
+        .sidebar-links a:hover, .sidebar-account a:hover { background: rgba(255,255,255,.07); color: #fff; text-decoration: none; }
+        .sidebar-links a.active { background: #1d4ed8; color: #fff; font-weight: 600; }
+        .sidebar-icon { width: 24px; height: 24px; flex: none; display: grid; place-items: center; border-radius: 7px; background: rgba(88,122,203,.2); color: #b8c8f2; font-size: .58rem; font-weight: 800; }
+        .sidebar-links a.active .sidebar-icon { background: var(--warning); color: #10204a; }
+        .sidebar-account { margin-top: auto; padding-top: 12px; border-top: 1px solid rgba(201,212,245,.12); }
+        .sidebar-person { display: flex; align-items: center; gap: 9px; margin: 2px 2px 8px; padding: 8px; border-radius: 10px; background: rgba(255,255,255,.05); color: #fff; font-size: .76rem; font-weight: 600; }
+        .sidebar-person small { display: block; color: #a8b5d4; font-size: .64rem; font-weight: 400; }
+        .sidebar-account .nav-profile { width: 100%; color: #c9d4f5; }
+        .sidebar-account .nav-profile.active { background: rgba(255,255,255,.08); color: #fff; }
+        .sidebar-account .nav-profile span { min-width: 0; overflow-wrap: anywhere; }
+        .sidebar-account .nav-profile small { display: block; color: #a8b5d4; font-size: .64rem; font-weight: 400; }
+        .sidebar-account .sidebar-logout { min-height: 36px; color: #a8b5d4; font-size: .78rem; }
+        .app-content { min-width: 0; display: flex; flex-direction: column; }
+        .workspace-header { min-height: 60px; display: flex; justify-content: space-between; align-items: center; gap: 16px; padding: 10px 28px; background: #101a33; border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 2; }
+        .workspace-heading p { margin: 0 0 2px; color: #8495bc; font-size: .62rem; font-weight: 800; letter-spacing: .16em; }
+        .workspace-heading h1 { margin: 0; color: #edf2ff; font-size: .95rem; font-weight: 650; letter-spacing: 0; }
+        .workspace-role { padding: 5px 11px; border: 1px solid rgba(251,191,36,.24); border-radius: 999px; background: rgba(251,191,36,.08); color: #fbbf24; font-size: .7rem; font-weight: 700; }
         .topbar { background: var(--primary-dark); border-bottom: 1px solid var(--border); padding: 16px 24px; display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 16px; box-shadow: var(--shadow); position: sticky; top: 0; z-index: 100; }
         .brand { font-weight: 700; font-size: 1.1rem; color: #fff; display: flex; align-items: center; gap: 8px; }
         .nav-links { display: flex; gap: 8px; flex-wrap: wrap; }
@@ -1364,12 +1478,12 @@ public class YEPWebApp {
         .nav-avatar { width: 30px; height: 30px; border-radius: 50%; object-fit: cover; background: #fbbf24; color: #0a1f5c; display: inline-flex; align-items: center; justify-content: center; font-weight: 700; }
         .profile-heading { display: flex; align-items: center; gap: 20px; }
         .profile-photo { width: 112px; height: 112px; border-radius: 50%; object-fit: cover; border: 3px solid var(--border); }
-        .profile-photo.placeholder { display: flex; align-items: center; justify-content: center; background: var(--primary-light); color: var(--primary-dark); font-size: 2rem; font-weight: 700; }
+        .profile-photo.placeholder { display: flex; align-items: center; justify-content: center; background: var(--primary-light); color: #edf2ff; font-size: 2rem; font-weight: 700; }
         .enrollment-option { display: flex; align-items: flex-start; gap: 12px; padding: 14px 0; border-bottom: 1px solid var(--border); }
         .enrollment-option input { width: auto; margin-top: 5px; }
         .progress-track { height: 10px; background: var(--bg); border-radius: 99px; overflow: hidden; }
         .progress-fill { height: 100%; background: var(--primary); border-radius: inherit; }
-        .container { max-width: 1100px; margin: 32px auto; padding: 0 20px; }
+        .container { width: 100%; max-width: 1440px; margin: 32px auto; padding: 0 24px; }
 
         /* Components */
         .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 24px; margin-bottom: 24px; box-shadow: var(--shadow); }
@@ -1385,11 +1499,11 @@ public class YEPWebApp {
         input:focus, select:focus, textarea:focus { outline: none; border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-light); }
 
         .badge { display: inline-block; padding: 2px 10px; border-radius: 999px; background: var(--bg); color: var(--text-muted); font-size: 0.75rem; font-weight: 600; border: 1px solid var(--border); }
-        .badge.success { background: var(--primary-light); color: var(--primary-dark); border-color: var(--primary-light); }
+        .badge.success { background: #123b3b; color: #a7f3d0; border-color: #1b5551; }
         .badge.warning { background: #fef3c7; color: #92400e; border-color: #fde68a; }
         .alert { padding: 12px 16px; border-radius: 8px; margin-bottom: 20px; font-size: 0.9rem; }
         .alert.error { background: #fef2f2; border: 1px solid #fecaca; color: var(--danger); }
-        .alert.success { background: var(--primary-light); border: 1px solid #bbf7d0; color: var(--primary-dark); }
+        .alert.success { background: #123b3b; border: 1px solid #1b5551; color: #a7f3d0; }
 
         .grid { display: grid; gap: 24px; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); }
         .grid-layout { display: grid; grid-template-columns: 2fr 1fr; gap: 24px; }
@@ -1428,18 +1542,27 @@ public class YEPWebApp {
         .carousel .dots span.active { background: #fff; }
 
         .footer { text-align: center; padding: 40px 20px; color: var(--text-muted); font-size: 0.85rem; border-top: 1px solid var(--border); margin-top: 40px; }
+        .app-content > .footer { width: 100%; margin-top: auto; padding: 20px; font-size: .75rem; }
+        .menu-toggle { display: none; border: 0; border-radius: 8px; background: transparent; color: #fff; cursor: pointer; }
+        .nav-scrim { display: none; }
         @media (max-width: 760px) {
+            .app-shell { display: block; }
+            .sidebar { position: fixed; inset: 0 auto 0 0; width: min(84vw, 280px); height: 100vh; height: 100dvh; padding: 16px 10px; transform: translateX(-105%); visibility: hidden; pointer-events: none; transition: transform .24s ease, visibility .24s; box-shadow: 12px 0 32px rgba(0,0,0,.24); overflow-y: auto; overscroll-behavior: contain; }
+            .sidebar.open { transform: translateX(0); visibility: visible; pointer-events: auto; }
+            .workspace-header { min-height: 60px; padding: 8px 14px; }
+            .menu-toggle { display: flex; align-items: center; justify-content: center; width: 40px; height: 40px; margin-left: auto; order: 2; }
+            .nav-scrim:not([hidden]) { display: block; position: fixed; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(4, 12, 35, .68); z-index: 2; }
+            .workspace-role { margin-left: auto; }
             .topbar { flex-wrap: nowrap; padding: 12px 16px; gap: 12px; }
-            .brand { white-space: nowrap; }
-            .menu-toggle { display: flex; align-items: center; justify-content: center; width: 44px; height: 44px; margin-left: auto; position: relative; z-index: 3; }
-            .nav-scrim:not([hidden]) { display: block; position: fixed; inset: 0; width: 100%; height: 100%; padding: 0; border: 0; background: rgba(4, 12, 35, .58); z-index: 1; }
-            .nav-links { position: fixed; inset: 0 0 0 auto; width: min(84vw, 340px); height: 100vh; height: 100dvh; padding: 76px 18px 24px; background: var(--primary-dark); box-shadow: -12px 0 32px rgba(0,0,0,.24); display: flex; flex-direction: column; align-items: stretch; flex-wrap: nowrap; gap: 6px; overflow-y: auto; overscroll-behavior: contain; transform: translateX(105%); visibility: hidden; pointer-events: none; transition: transform .24s ease, visibility .24s; z-index: 2; }
-            .nav-links.open { transform: translateX(0); visibility: visible; pointer-events: auto; }
-            .nav-links a { display: flex; align-items: center; min-height: 44px; padding: 10px 12px; font-size: 1rem; }
-            .nav-links > span { border-left: 0 !important; border-top: 1px solid rgba(255,255,255,.24); height: 1px; margin: 8px 0 !important; }
-            .nav-profile { gap: 10px; }
+            .topbar .brand { white-space: nowrap; }
+            .topbar .menu-toggle { position: relative; z-index: 3; }
+            .topbar .nav-links { position: fixed; inset: 0 0 0 auto; width: min(84vw, 340px); height: 100vh; height: 100dvh; padding: 76px 18px 24px; background: var(--primary-dark); box-shadow: -12px 0 32px rgba(0,0,0,.24); display: flex; flex-direction: column; align-items: stretch; flex-wrap: nowrap; gap: 6px; overflow-y: auto; overscroll-behavior: contain; transform: translateX(105%); visibility: hidden; pointer-events: none; transition: transform .24s ease, visibility .24s; z-index: 2; }
+            .topbar .nav-links.open { transform: translateX(0); visibility: visible; pointer-events: auto; }
+            .topbar .nav-links a { display: flex; align-items: center; min-height: 44px; padding: 10px 12px; font-size: 1rem; }
+            .topbar .nav-links > span { border-left: 0 !important; border-top: 1px solid rgba(255,255,255,.24); height: 1px; margin: 8px 0 !important; }
+            .topbar .nav-profile { gap: 10px; }
             body.nav-open { overflow: hidden; }
-            .container { margin: 20px auto; padding: 0 14px; }
+            .container { margin: 22px auto; padding: 0 14px; }
             .card { padding: 18px; margin-bottom: 18px; }
             .carousel { height: min(58vh, 360px); min-height: 250px; }
             .slide { padding: 24px 18px; }
@@ -1453,6 +1576,23 @@ public class YEPWebApp {
 
     static String page(String title, User user, String activePath, String content) {
         String sid = currentSessionId(user);
+        if (user != null) {
+            return "<!DOCTYPE html><html lang='en'><head>" +
+                    "<meta charset='utf-8'>" +
+                    "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
+                    "<title>" + esc(title) + " — YEP</title>" +
+                    "<style>" + CSS + "</style>" +
+                    "</head><body><div class='app-shell'>" +
+                    nav(user, activePath) +
+                    "<div class='app-content'><header class='workspace-header' id='topbar'>" +
+                    "<div class='workspace-heading'><p>YEP WORKSPACE</p><h1>" + esc(title) + "</h1></div>" +
+                    "<span class='workspace-role'>" + esc(user.getRole().getLabel()) + "</span>" +
+                    "<button class='menu-toggle' id='menuToggle' type='button' aria-label='Open navigation menu' aria-controls='siteNav' aria-expanded='false'><span class='menu-icon' aria-hidden='true'><span></span><span></span><span></span></span></button>" +
+                    "<button class='nav-scrim' id='navScrim' type='button' aria-label='Close navigation menu' hidden></button>" +
+                    "</header><main class='container'>" + flashHtml(sid) + content + "</main>" +
+                    "<footer class='footer'>© 2026 Youth Empowerment Project · Built for East Africa</footer></div></div>" +
+                    "<script>" + CAROUSEL_JS + NAV_JS + "</script></body></html>";
+        }
         return "<!DOCTYPE html><html lang='en'><head>" +
                 "<meta charset='utf-8'>" +
                 "<meta name='viewport' content='width=device-width,initial-scale=1'>" +
@@ -1468,6 +1608,24 @@ public class YEPWebApp {
 
     static String nav(User user, String activePath) {
         StringBuilder sb = new StringBuilder();
+        if (user != null) {
+            sb.append("<aside class='sidebar' id='siteNav' aria-label='Main navigation'>")
+                    .append("<a href='/dashboard' class='sidebar-brand' style='text-decoration:none'><span class='sidebar-mark'>YEP</span><span>YEP Platform<small>Youth Empowerment</small></span></a>")
+                    .append("<p class='sidebar-label'>Workspace</p><nav class='sidebar-links'>");
+            if (!isLimitedStakeholder(user)) {
+                appendSidebarLink(sb, "/dashboard", "DB", "Dashboard", activePath.equals("/dashboard"));
+                appendSidebarLink(sb, "/activities", "AC", "Activities", activePath.equals("/activities"));
+                appendSidebarLink(sb, "/level-one", "L1", "Level 1", activePath.equals("/level-one"));
+                appendSidebarLink(sb, "/live-session", "LS", "Live Session", activePath.equals("/live-session"));
+                appendSidebarLink(sb, "/level-two", "L2", "Level 2", activePath.equals("/level-two"));
+                appendSidebarLink(sb, "/discussion", "DS", "Discussions", activePath.equals("/discussion") || activePath.equals("/thread"));
+                appendSidebarLink(sb, "/certificate", "CT", "Certificates", activePath.equals("/certificate"));
+            }
+            sb.append("</nav><div class='sidebar-account'><a href='/profile' class='nav-profile ").append(activePath.equals("/profile") ? "active" : "").append("'>")
+                    .append(profileAvatarHtml(user)).append("<span>My Profile<small>").append(esc(user.getName())).append(" · ").append(esc(user.getRole().getLabel())).append("</small></span></a>")
+                    .append("<a class='sidebar-logout' href='/logout'>Logout</a></div></aside>");
+            return sb.toString();
+        }
         sb.append("<header class='topbar' id='topbar'><a href='/dashboard' class='brand' style='text-decoration:none'>🌍 YEP Platform</a>")
                 .append("<button class='menu-toggle' id='menuToggle' type='button' aria-label='Open navigation menu' aria-controls='siteNav' aria-expanded='false'><span class='menu-icon' aria-hidden='true'><span></span><span></span><span></span></span></button>")
                 .append("<button class='nav-scrim' id='navScrim' type='button' aria-label='Close navigation menu' hidden></button>")
@@ -1476,23 +1634,14 @@ public class YEPWebApp {
             sb.append("<a href='/' class='").append(activePath.equals("/") ? "active" : "").append("'>Home</a>");
             sb.append("<a href='/login' class='").append(activePath.equals("/login") ? "active" : "").append("'>Sign in</a>");
             sb.append("<a href='/register' class='btn primary small' style='margin-left:8px'>Join YEP</a>");
-        } else {
-            if (!isLimitedStakeholder(user)) {
-                sb.append("<a href='/dashboard' class='").append(activePath.equals("/dashboard") ? "active" : "").append("'>Dashboard</a>");
-                sb.append("<a href='/activities' class='").append(activePath.equals("/activities") ? "active" : "").append("'>Activities</a>");
-                sb.append("<a href='/level-one' class='").append(activePath.equals("/level-one") ? "active" : "").append("'>Level 1</a>");
-                sb.append("<a href='/live-session' class='").append(activePath.equals("/live-session") ? "active" : "").append("'>Live Session</a>");
-                sb.append("<a href='/level-two' class='").append(activePath.equals("/level-two") ? "active" : "").append("'>Level 2</a>");
-                sb.append("<a href='/discussion' class='").append(activePath.equals("/discussion") || activePath.equals("/thread") ? "active" : "").append("'>Discussions</a>");
-                sb.append("<a href='/certificate' class='").append(activePath.equals("/certificate") ? "active" : "").append("'>Certificates</a>");
-            }
-            sb.append("<span style='border-left:1px solid var(--border);margin:0 8px'></span>");
-            sb.append("<a href='/profile' class='nav-profile ").append(activePath.equals("/profile") ? "active" : "").append("'>")
-                    .append(profileAvatarHtml(user)).append("<span>My Profile</span></a>");
-            sb.append("<a href='/logout' style='color:var(--danger)'>Logout</a>");
         }
         sb.append("</nav></header>");
         return sb.toString();
+    }
+
+    static void appendSidebarLink(StringBuilder sb, String href, String icon, String label, boolean active) {
+        sb.append("<a href='").append(href).append("' class='").append(active ? "active" : "").append("'><span class='sidebar-icon' aria-hidden='true'>")
+                .append(icon).append("</span>").append(label).append("</a>");
     }
 
     static boolean isLimitedStakeholder(User user) {
