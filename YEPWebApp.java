@@ -132,6 +132,11 @@ public class YEPWebApp {
                     else sendHtml(ex, 405, page("Method not allowed", user, "/activities",
                             "<div class='card'><h1>Method not allowed</h1></div>"));
                 }
+                case "/activity/material" -> {
+                    if (method.equals("GET")) activityMaterialsGet(ex, user);
+                    else sendHtml(ex, 405, page("Method not allowed", user, "/activities",
+                            "<div class='card'><h1>Method not allowed</h1></div>"));
+                }
                 case "/level-one/complete" -> {
                     if (method.equals("POST")) levelOneCompletePost(ex, user);
                     else sendHtml(ex, 405, page("Method not allowed", user, "/level-one",
@@ -797,13 +802,8 @@ public class YEPWebApp {
         } else {
             content.append("<span class='badge'>In progress</span>");
         }
-        String materialsUrl = safeHttpUrl(activity.getContentUrl());
-        if (materialsUrl != null) {
-            content.append("<p class='mt-4'><a class='btn primary' href='").append(esc(materialsUrl))
-                    .append("' target='_blank' rel='noopener noreferrer'>Open course materials</a></p>");
-        } else {
-            content.append("<p class='muted mt-4'>Course materials are not available for this activity yet.</p>");
-        }
+        content.append("<p class='mt-4'><a class='btn primary' href='/activity/material?id=")
+                .append(activityId).append("'>Open course materials</a></p>");
         if (activity.getLevel() == ActivityLevel.LEVEL_ONE
                 && enrollment.get().getStatus() != EnrollmentStatus.COMPLETED) {
             content.append("<form method='post' action='/level-one/complete' class='mt-4'>")
@@ -813,6 +813,130 @@ public class YEPWebApp {
         }
         content.append("</div>");
         sendHtml(ex, 200, page(activity.getTitle(), user, "/activities", content.toString()));
+    }
+
+    static void activityMaterialsGet(HttpExchange ex, User user) throws IOException {
+        if (user == null) { redirect(ex, "/login"); return; }
+        String id = parseQuery(ex.getRequestURI().getQuery()).get("id");
+        long activityId;
+        try {
+            activityId = Long.parseLong(id);
+        } catch (NumberFormatException | NullPointerException e) {
+            sendHtml(ex, 404, page("Course materials not found", user, "/activities",
+                    "<div class='card'><h1>Course materials not found</h1><a class='btn' href='/activities'>Browse activities</a></div>"));
+            return;
+        }
+        Optional<LearningActivity> activityOpt = ACTIVITIES.findById(activityId)
+                .filter(LearningActivity::isPublished);
+        if (activityOpt.isEmpty()) {
+            sendHtml(ex, 404, page("Course materials not found", user, "/activities",
+                    "<div class='card'><h1>Course materials not found</h1><a class='btn' href='/activities'>Browse activities</a></div>"));
+            return;
+        }
+        LearningActivity activity = activityOpt.get();
+        if (activity.getLevel() == ActivityLevel.LEVEL_TWO && !canAccessLevelTwo(user)) {
+            sendHtml(ex, 403, page("Level Two locked", user, "/level-two",
+                    "<div class='card'><h1>Level Two is locked</h1><p class='muted'>Complete all Level One activities before accessing these materials.</p><a class='btn primary' href='/level-one'>Continue Level One</a></div>"));
+            return;
+        }
+        Optional<Enrollment> enrollment = ENROLLS.findAll().stream()
+                .filter(e -> e.getUserId().equals(user.getId()) && e.getActivityId().equals(activityId))
+                .findFirst();
+        if (enrollment.isEmpty()) {
+            sendHtml(ex, 403, page("Enrollment required", user, "/activities",
+                    "<div class='card'><h1>Enrollment required</h1><p class='muted'>Enroll in this activity before opening its course materials.</p><a class='btn primary' href='/activities'>Browse activities</a></div>"));
+            return;
+        }
+
+        StringBuilder content = new StringBuilder("<a class='btn mb-4' href='/activity?id=")
+                .append(activityId).append("'>Back to course</a>")
+                .append("<div class='page-header'><h1>").append(esc(activity.getTitle()))
+                .append("</h1><p class='muted'>").append(esc(activity.getCategory()))
+                .append(" · ").append(activity.getType()).append("</p></div>")
+                .append(courseMaterialsHtml(activity));
+        if (activity.getLevel() == ActivityLevel.LEVEL_ONE) {
+            if (enrollment.get().getStatus() == EnrollmentStatus.COMPLETED) {
+                content.append("<div class='card'><span class='badge success'>Completed ✓</span></div>");
+            } else {
+                content.append("<div class='card'><h2>Finish this activity</h2>")
+                        .append("<p class='muted'>Work through the lesson and practice task, then record your completion.</p>")
+                        .append("<form method='post' action='/level-one/complete'>")
+                        .append("<input type='hidden' name='activityId' value='").append(activityId).append("'>")
+                        .append("<input type='hidden' name='returnToActivity' value='true'>")
+                        .append("<button class='btn primary' type='submit'>Mark activity complete</button></form></div>");
+            }
+        } else {
+            content.append("<div class='card'><h2>Continue with your team</h2><p class='muted'>Use the Level Two workspace to work with your team and mentor.</p>")
+                    .append("<a class='btn primary' href='/level-two'>Open Level Two workspace</a></div>");
+        }
+        sendHtml(ex, 200, page("Course materials — " + activity.getTitle(), user, "/activities", content.toString()));
+    }
+
+    static String courseMaterialsHtml(LearningActivity activity) {
+        List<String> objectives;
+        String lesson;
+        String practice;
+        String checkQuestion;
+        String checkAnswer;
+        switch (activity.getTitle()) {
+            case "AI Literacy Fundamentals" -> {
+                objectives = List.of("Explain how AI systems use patterns in examples.", "Check AI-generated claims before relying on them.", "Protect personal information when using digital tools.");
+                lesson = "AI systems identify patterns in data and use them to produce predictions or responses. A fluent answer is not proof that it is correct: generated text can contain invented details, reflect gaps in its training data, or repeat bias. Treat AI as a tool for ideas, verify important claims with trustworthy sources, and never enter private information unless the service is approved for it.";
+                practice = "Choose a question about a community issue. Ask an AI tool for an answer, identify two factual claims, and verify each against a reliable primary source and an independent source. Note one limitation or uncertainty before sharing the answer.";
+                checkQuestion = "Does a confident-sounding AI answer prove that its claims are true?";
+                checkAnswer = "No. Check the original evidence and corroborate important claims with independent, trustworthy sources.";
+            }
+            case "Digital Storytelling Workshop" -> {
+                objectives = List.of("Build a clear story with a beginning, change, and outcome.", "Ask permission before recording or sharing someone's story.", "Make stories accurate and accessible.");
+                lesson = "A useful short story introduces a person or community, explains a real challenge, shows what people did, and ends with a result or next step. Keep the person's voice central and distinguish verified facts from opinion. Get informed consent for interviews, photos, and recordings; explain where the story will appear and let contributors decline. Add captions or a transcript so more people can follow the story.";
+                practice = "Draft a three-part, 60-second story about a positive local change: who is involved, what changed, and what happens next. Mark any facts that need checking and list the permissions you would need before publishing.";
+                checkQuestion = "What should you do before publishing an interview or identifiable photo?";
+                checkAnswer = "Get informed permission, explain how it will be used, verify the details, and avoid exposing private or unsafe information.";
+            }
+            case "Intercultural Communication Live" -> {
+                objectives = List.of("Listen to understand before responding.", "Ask open questions instead of relying on assumptions.", "Disagree respectfully and clarify meaning.");
+                lesson = "People within the same community can have different experiences, so one person cannot speak for everyone. Use clear language, allow time for responses, and check that you understood: paraphrase what you heard and invite correction. When something feels unclear, ask a respectful, open question rather than guessing at someone's intent.";
+                practice = "A teammate misses a deadline. Write a response that separates what you observed from what you assumed, then ask a neutral question about what support or clarification is needed.";
+                checkQuestion = "How can you check an interpretation without stereotyping?";
+                checkAnswer = "Describe what you observed, share your interpretation as uncertain, and ask the person an open question.";
+            }
+            case "Mastering Generative AI Tools" -> {
+                objectives = List.of("Write prompts with a goal, context, constraints, and output format.", "Improve results through review and iteration.", "Use generated work responsibly and protect sensitive data.");
+                lesson = "A helpful prompt states the task, gives relevant context, sets constraints, and names the format you need. Improve results by asking focused follow-up questions rather than trusting the first response. Check facts, calculations, and citations yourself. Do not enter passwords, personal records, or confidential project information into an unapproved tool, and review generated material for bias and rights concerns before using it.";
+                practice = "Write a prompt for a one-page community workshop plan. Include the audience, learning goal, time limit, required sections, and a request to flag facts that need verification. Review the response and revise one part.";
+                checkQuestion = "Which parts make a prompt easier to answer well?";
+                checkAnswer = "A clear task, relevant context, constraints, and the requested output format; then review and verify the result.";
+            }
+            case "Fighting Misinformation in East Africa" -> {
+                objectives = List.of("Pause before sharing a surprising claim.", "Trace a claim or image to its original source.", "Compare evidence across reliable sources.");
+                lesson = "Use a simple verification routine: stop before sharing; investigate who published the claim and why; find independent, reliable reporting; and trace quotes, images, or video to their original context. Check dates and locations, since old media can be recirculated as new. A screenshot or a large number of shares is not evidence. If the evidence is uncertain, say so and avoid amplifying the claim.";
+                practice = "Select a public claim that can be checked without exposing anyone's private information. Record its original source, publication date, two independent sources you consulted, and what evidence supports or contradicts it.";
+                checkQuestion = "What should you do if you cannot verify a claim?";
+                checkAnswer = "Do not present it as fact or amplify it; explain that it remains unverified and keep looking for reliable evidence.";
+            }
+            case "Level Two: AgriTech Impact Teams" -> {
+                objectives = List.of("Understand a farming challenge before proposing a tool.", "Co-design and test a small, practical solution.", "Plan for connectivity, language, accessibility, and data privacy.");
+                lesson = "Start with farmers' priorities rather than assuming an app is the answer. Ask open questions about current decisions, constraints, and trusted advice. Build a small prototype with users, test it in realistic conditions, and revise it from feedback. Consider low-connectivity and offline use, local language, device access, accessibility, and the minimum data needed. Make clear who can see any collected data.";
+                practice = "Draft five respectful discovery questions for farmers. Then sketch a low-connectivity crop-advice prototype and name one way you would test its usefulness and one risk you would reduce.";
+                checkQuestion = "Why should a team test a prototype with the people who will use it?";
+                checkAnswer = "To find out whether it fits real needs and constraints, uncover usability problems, and improve it before wider use.";
+            }
+            default -> {
+                objectives = List.of("Describe the activity's main idea.", "Apply the idea to a practical example.", "Reflect on what you would verify or improve.");
+                lesson = activity.getDescription() + " Use reliable information, consider who may be affected, and check important assumptions before acting.";
+                practice = "Write down one real situation where this topic matters, a practical action you could try, and what evidence would help you assess the result.";
+                checkQuestion = "What is one responsible next step before applying this idea?";
+                checkAnswer = "Check the relevant evidence, consider who is affected, and seek feedback from people with direct experience.";
+            }
+        }
+        StringBuilder html = new StringBuilder("<div class='card'><h2>Learning goals</h2><ul class='list compact'>");
+        for (String objective : objectives) html.append("<li>").append(esc(objective)).append("</li>");
+        html.append("</ul></div><div class='card'><h2>Lesson</h2><p>").append(esc(lesson))
+                .append("</p></div><div class='card'><h2>Practice activity</h2><p>").append(esc(practice))
+                .append("</p><details class='mt-4'><summary>Check your understanding</summary><p class='mt-2'><strong>")
+                .append(esc(checkQuestion)).append("</strong></p><p>").append(esc(checkAnswer))
+                .append("</p></details></div>");
+        return html.toString();
     }
 
     static void enroll(HttpExchange ex, User user) throws IOException {
@@ -1076,7 +1200,11 @@ public class YEPWebApp {
         Map<String, String> f = parseForm(ex);
         try {
             Long actId = Long.parseLong(f.get("activityId"));
+            LearningActivity activity = ACTIVITIES.findById(actId)
+                    .filter(a -> a.getLevel() == ActivityLevel.LEVEL_TWO && a.isPublished())
+                    .orElseThrow(() -> new ValidationException("Choose a valid, published Level Two exchange."));
             TEAM_SVC.createTeam(f.get("teamName"), actId, user);
+            if (!hasEnrollment(user, activity)) LEARNING.enroll(user, activity);
             setFlash(ex, "Team created successfully!");
             redirect(ex, "/level-two");
         } catch (Exception e) {
@@ -1863,6 +1991,9 @@ public class YEPWebApp {
             TEAM_SVC.addMember(agri, bob);
             TEAM_SVC.addMember(agri, charlie);
             TEAM_SVC.assignMentor(agri, grace);
+            LEARNING.enroll(alice, l2Agri);
+            LEARNING.enroll(bob, l2Agri);
+            LEARNING.enroll(charlie, l2Agri);
 
             ImpactProject proj = PROJ_SVC.create(agri, "Smart Agri Advisor", ChallengeArea.AGRICULTURE, "Mobile-first crop advisory service for smallholder farmers", LocalDate.now(), LocalDate.now().plusMonths(3));
             PROJ_SVC.addMilestone(proj, "Problem statement", LocalDate.now().plusDays(7));

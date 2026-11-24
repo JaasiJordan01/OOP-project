@@ -25,6 +25,8 @@ Registration supports Youth Participants, Facilitators/Lecturers, Mentors, Unive
 
 After youth signup, the participant is signed in and can enroll in Level One activities immediately. Eligible youth accounts can use the normal login flow without waiting for administrator approval.
 
+Participants with no activity enrollments are taken to the course-selection screen after signing in. Enrolled activities open a protected in-app materials page with learning goals, a lesson, a practice task, and a self-check. Completing a Level One activity updates the participant's progress; Level Two team members can open the AgriTech project guide.
+
 Level One progress is calculated from completed enrollments in every published Level One activity. Youth participants can access Level Two exchanges, teams, and project pages only after all of those activities are complete; the restriction is enforced on page views and form submissions. Seed demonstration participants are marked complete across the Level One path so the existing Level Two demo remains usable. In this prototype, the activity completion button records completion and is not a substitute for a production assessment or attendance-verification workflow.
 
 All stakeholder accounts can add or update a profile photo from **My Profile**. Uploads are limited to PNG/JPEG, 2 MB, and bounded image dimensions; filenames are randomized and the image signature is checked. Files are stored locally in `uploads/profile-photos/` by default (or in the directory configured by `YEP_PROFILE_PHOTO_DIR`) and are excluded from Git. User/profile records remain in memory and reset on restart, so local photo files can outlive their corresponding demo records.
